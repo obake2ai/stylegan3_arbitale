@@ -64,7 +64,7 @@ parser.add_argument("--resize_fhd_v", action='store_true', default=False)
 parser.add_argument('--prores', action='store_true', help='output video in ProRes format')
 
 parser.add_argument('--affine_angle', type=float, default=0.0)
-parser.add_argument('--affine_transfrom', default='0.0-0.0')
+parser.add_argument('--affine_transform', default='0.0-0.0')
 parser.add_argument('--affine_scale', default='1.0-1.0')
 
 
@@ -72,7 +72,7 @@ a = parser.parse_args()
 
 if a.size is not None: a.size = [int(s) for s in a.size.split('-')][::-1]
 if a.ar is not None: a.ar = [int(s) for s in a.ar.split('-')][::-1]
-if a.affine_transfrom is not None: a.affine_transfrom = [float(s) for s in a.affine_transfrom.split('-')][::-1]
+if a.affine_transform is not None: a.affine_transform = [float(s) for s in a.affine_transform.split('-')][::-1]
 if a.affine_scale is not None: a.affine_scale = [float(s) for s in a.affine_scale.split('-')][::-1]
 
 
@@ -355,10 +355,10 @@ def generate(noise_seed):
 
     #Gs = prune_layer(Gs, 'L1_', a.prune)
 
-    if (a.affine_transfrom != [0.0, 0.0] or a.affine_scale != [1.0, 1.0] or a.affine_angle != 0.0):
+    if (a.affine_transform != [0.0, 0.0] or a.affine_scale != [1.0, 1.0] or a.affine_angle != 0.0):
         print("Applying Affine Convertion...")
-        transform(Gs, a.affine_angle, a.affine_transfrom[0], a.affine_transfrom[1], a.affine_scale[0], a.affine_scale[1])
-        out_name = out_name + "_affine_a%s_t%s-%s_s%s-%s"%(str(a.affine_angle).replace(".", "_"), str(a.affine_transfrom[0]).replace(".", "_"), str(a.affine_transfrom[1]).replace(".", "_"), str(a.affine_scale[0]).replace(".", "_"), str(a.affine_scale[1]).replace(".", "_"))
+        transform(Gs, a.affine_angle, a.affine_transform[0], a.affine_transform[1], a.affine_scale[0], a.affine_scale[1])
+        out_name = out_name + "_affine_a%s_t%s-%s_s%s-%s"%(str(a.affine_angle).replace(".", "_"), str(a.affine_transform[0]).replace(".", "_"), str(a.affine_transform[1]).replace(".", "_"), str(a.affine_scale[0]).replace(".", "_"), str(a.affine_scale[1]).replace(".", "_"))
 
 
     def make_frame(t):
