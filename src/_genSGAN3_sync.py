@@ -24,7 +24,7 @@ import torch.nn.utils.prune as prune
 from analyzeSounds import analyzeSong
 import random
 
-desc = "Customized StyleGAN2-ada on PyTorch"
+desc = "Customized StyleGAN3 on PyTorch"
 parser = argparse.ArgumentParser(description=desc)
 parser.add_argument('--out_dir', default='_out', help='output directory')
 parser.add_argument('--model', default='models/ffhq-1024.pkl', help='path to pkl checkpoint file')
@@ -63,15 +63,38 @@ parser.add_argument("--resize_fhd_v", action='store_true', default=False)
 
 parser.add_argument('--prores', action='store_true', help='output video in ProRes format')
 
+parser.add_argument('--affine_angle', type=float, default=1.0)
+parser.add_argument('--affine_trasnfrom', default='0.0-0.0')
+parser.add_argument('--affine_scale', default='1.0-1.0')
+
+
 a = parser.parse_args()
 
 if a.size is not None: a.size = [int(s) for s in a.size.split('-')][::-1]
 if a.ar is not None: a.ar = [int(s) for s in a.ar.split('-')][::-1]
+if a.affine_trasnfrom is not None: a.affine_trasnfrom = [float(s) for s in a.affine_trasnfrom.split('-')][::-1]
+if a.affine_scale is not None: a.affine_scale = [float(s) for s in a.affine_scale.split('-')][::-1]
+
 
 [a.frames, a.fstep] = [int(s) for s in a.frames.split('-')]
 if a.prune is not None:
   outprune = f'_p{a.prune}_{a.prune_val}'
   a.prune = [f'L{int(s)}_' for s in a.prune.split('-')]
+
+def transform(G, angle, tx, ty, sx, sy):
+    m = np.eye(3)
+    s = np.sin(angle/360.0*np.pi*2)
+    c = np.cos(angle/360.0*np.pi*2)
+
+    m[0][0] = sx*c
+    m[0][1] = sx*s
+    m[0][2] = tx
+    m[1][0] = -sy*s
+    m[1][1] = sy*c
+    m[1][2] = ty
+
+    m = np.linalg.inv(m)
+    G.synthesis.input.transform.copy_(torch.from_numpy(m))
 
 def generate_images(
     G,
@@ -332,6 +355,11 @@ def generate(noise_seed):
 
     #Gs = prune_layer(Gs, 'L1_', a.prune)
 
+    if (a.affine_trasnfrom != [0.0, 0.0] or a.affine_scale != [1.0, 1.0] or a.affine_angle != 1.0):
+        print("Applying Affine Convertion...")
+        transform(Gs, a.affine_angle, a.affine_trasnfrom[0], a.affine_trasnfrom[1], a.affine_scale[0], a.affine_scale[1])
+
+
     def make_frame(t):
         frame_idx = int(np.clip(np.round(t * 30), 0, frame_count - 1))
         latent  = latents[frame_idx] # [X,512]
@@ -365,11 +393,11 @@ def generate(noise_seed):
           else:
               new_w = int(h * target_aspect_ratio)
               generated_frame = cv2.resize(generated_frame, (new_w, h))
-        
+
         if a.image == True:
           PIL.Image.fromarray(generated_frame, 'RGB').save(f'{a.out_dir}/seed{out_name}.png')
         else:
-          return generated_frame 
+          return generated_frame
 
 
     if a.image == True:
