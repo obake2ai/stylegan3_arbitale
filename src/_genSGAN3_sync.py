@@ -358,7 +358,7 @@ def generate(noise_seed):
     if (a.affine_trasnfrom != [0.0, 0.0] or a.affine_scale != [1.0, 1.0] or a.affine_angle != 0.0):
         print("Applying Affine Convertion...")
         transform(Gs, a.affine_angle, a.affine_trasnfrom[0], a.affine_trasnfrom[1], a.affine_scale[0], a.affine_scale[1])
-        out_name = out_name + "_affine_a%s_t%s-%s_s%s-%s"%(str(a.affine_angle).replace(".", "_"), str(a.affine_trasnfrom[0]).replace(".", "_"), str(a.affine_trasnfrom[1]).replace(".", "_"), str(a.affine_scale[0]).replace(".", "_"), str(a.affine__scale[1]).replace(".", "_"))
+        out_name = out_name + "_affine_a%s_t%s-%s_s%s-%s"%(str(a.affine_angle).replace(".", "_"), str(a.affine_trasnfrom[0]).replace(".", "_"), str(a.affine_trasnfrom[1]).replace(".", "_"), str(a.affine_scale[0]).replace(".", "_"), str(a.affine_scale[1]).replace(".", "_"))
 
 
     def make_frame(t):
