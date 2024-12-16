@@ -1,0 +1,2 @@
+CUDA_VISIBLE_DEVICES=1 python src/_genSGAN3.py --model ../../stylegan3/results/00041-stylegan3-r--gpus1-batch2-gamma6.6/network-snapshot-000312.pkl  --size 1080-1080 --frames 300-30
+CUDA_VISIBLE_DEVICES=0 python src/_genSGAN3.py --model ../../stylegan3/results/00041-stylegan3-r--gpus1-batch2-gamma6.6/network-snapshot-000312.pkl --frames 1200-60 --prune 0.1 --size 1400-3208 --digress 0.0 --variations 30 --noise_seed 5022
