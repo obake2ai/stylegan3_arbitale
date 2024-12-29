@@ -268,28 +268,29 @@ def generate(noise_seed):
 
     # distort image by tweaking initial const layer
     first_layer_channels = Gs.synthesis.input.channels  # 例: 1024
-    first_layer_size     = Gs.synthesis.input.size      # 例: 36
+    first_layer_size     = Gs.synthesis.input.size      # 例: [36, 36] (または単なる36)
+
     print("debug", first_layer_channels, first_layer_size)
 
-    # 生成したい shape: [1, first_layer_channels, first_layer_size, first_layer_size]
-    shape_for_dconst = [1, first_layer_channels, first_layer_size, first_layer_size]
-    print("debug", shape_for_dconst)
+    if isinstance(first_layer_size, (list, tuple, np.ndarray)):
+        h, w = first_layer_size[0], first_layer_size[1]
+    else:
+        h, w = first_layer_size, first_layer_size
+
+    shape_for_dconst = [1, first_layer_channels, h, w]
+    print("debug shape_for_dconst =", shape_for_dconst)
 
     if a.digress > 0:
         dconst_list = []
         for i in range(n_mult):
-            # latent_anima() の引数を (C,H,W) = (first_layer_channels, first_layer_size, first_layer_size) に
-            # 変更することで 4x4 ではなく 36x36 でノイズを生成
             dc_tmp = a.digress * latent_anima(
-                shape_for_dconst,  # これで [1, 1024, 36, 36] 相当を作る
+                shape_for_dconst,  # [1, 1024, 36, 36] 等
                 a.frames, a.fstep, cubic=True, seed=noise_seed, verbose=False
             )
             dconst_list.append(dc_tmp)
-        # フレーム数方向などに応じて結合
         dconst = np.concatenate(dconst_list, axis=1)
     else:
-        # digress=0 の場合はダミーゼロ
-        dconst = np.zeros([frame_count, 1, first_layer_channels, first_layer_size, first_layer_size])
+        dconst = np.zeros([frame_count, 1, first_layer_channels, h, w])
 
     dconst = torch.from_numpy(dconst).to(device)
 
