@@ -79,7 +79,7 @@ def make_out_name(a):
     def fmt_f(v):
         return str(v).replace('.', '_')
 
-    model_name = basename(a.model)  # 例: 'models/ffhq-1024.pkl' → 'ffhq-1024.pkl'
+    model_name = basename(a.model)
 
     out_name = f"{model_name}_seed{a.noise_seed}"
 
@@ -209,9 +209,20 @@ def generate(noise_seed):
             angles = (angles - 0.5) * 180.
         else:
             angles = np.zeros((1, n_mult, 1))
+        # 拡大率 (scale_x, scale_y) を各フレームに反映
+        # ここでは a.affine_scale = [scale_y, scale_x] を想定し、全フレーム同一値にしています
+        # (毎フレームアニメさせたい場合は latent_anima 等で生成してもOK)
+        scale_array = np.array([a.affine_scale[0], a.affine_scale[1]], dtype=np.float32)  # (scale_y, scale_x)
+        # shifts.shape = [frame_count, n_mult, 2]
+        # angles.shape = [frame_count, n_mult, 1]
+        #  → 同じフレーム数・枚数に合わせて scale_array をタイル展開
+        scales = np.tile(scale_array, (shifts.shape[0], shifts.shape[1], 1))  # [frame_count, n_mult, 2]
+
         shifts = torch.from_numpy(shifts).to(device)
         angles = torch.from_numpy(angles).to(device)
-        trans_params = list(zip(shifts, angles))
+        scales = torch.from_numpy(scales).to(device)   # [frame_count, X, 2]
+
+        trans_params = list(zip(shifts, angles, scales))
 
     # Affine Convertion ***not working ***
     if (a.affine_transform != [0.0, 0.0] or a.affine_scale != [1.0, 1.0] or a.affine_angle != 0.0):

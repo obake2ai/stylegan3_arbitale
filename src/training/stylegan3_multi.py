@@ -27,17 +27,20 @@ from util.utilgan import fix_size, multimask
 
 # Construct an inverse rotation/translation matrix for generator.
 # generator expects inverse matrix to avoid potentially failing numerical operations in the network.
-def make_transform(translate: Tuple[float,float], angle: float, invert=False):
+def make_transform(translate: Tuple[float,float], angle: float, scale: Tuple[float, float],　invert=False):
     # print(translate)
     m = torch.eye(3)
     pi = torch.tensor(np.pi)
     s = torch.sin(angle/360.0*pi*2)
     c = torch.cos(angle/360.0*pi*2)
-    m[0][0] = c
-    m[0][1] = s
+
+    sy, sx = scale
+
+    m[0][0] = sx * c
+    m[0][1] = sx * s
     m[0][2] = translate[1] # 0 in numpy
-    m[1][0] = -s
-    m[1][1] = c
+    m[1][0] = -sy * s
+    m[1][1] =  sy * c
     m[1][2] = translate[0] # 1 in numpy
     if invert is True:
         m = torch.inverse(m)
@@ -142,13 +145,14 @@ class SynthesisInput(torch.nn.Module):
         if trans_param is None:
             transforms = self.transform.unsqueeze(0) # [batch, row, col]
         else:
-            shifts, angles = trans_param
+            shifts, angles, scales = trans_param
             # print('shifts, angles', shifts, angles)
             assert len(shifts) == len(angles)
+            assert len(shifts) == len(scales)
             transforms = []
             for i in range(len(shifts)):
                 # print('shift, angle', shifts[i], angles[i])
-                transform = make_transform(shifts[i], angles[i], invert=True).to(w.device)
+                transform = make_transform(shifts[i], angles[i], scales[i], invert=True).to(w.device)
                 transforms.append(transform.unsqueeze(0))
             transforms = torch.cat(transforms, 0) # [batch, row, col]
         # print(transforms)
