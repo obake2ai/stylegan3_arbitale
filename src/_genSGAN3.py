@@ -86,6 +86,7 @@ def make_out_name(a):
         out_name += f"_size{a.size[1]}x{a.size[0]}"
 
     out_name += f"_nXY{a.nXY}"
+    out_name += f"_frames{a.frames}"
     out_name += f"_trunc{fmt_f(a.trunc)}"
     if a.cubic:
         out_name += "_cubic"
