@@ -199,7 +199,7 @@ class SynthesisInput(torch.nn.Module):
             x = x @ weight.t()
 
             xs.append(x)
-            
+
         x = torch.cat(xs, 0)
 
         # Ensure correct shape.
@@ -273,7 +273,7 @@ class SynthesisLayer(torch.nn.Module):
         self.conv_kernel = 1 if is_torgb else conv_kernel
         self.conv_clamp = conv_clamp
         self.magnitude_ema_beta = magnitude_ema_beta
-        
+
         # Setup parameters and buffers.
         self.affine = FullyConnectedLayer(self.w_dim, self.in_channels, bias_init=1)
         self.weight = torch.nn.Parameter(torch.randn([self.out_channels, self.in_channels, self.conv_kernel, self.conv_kernel]))
@@ -302,7 +302,7 @@ class SynthesisLayer(torch.nn.Module):
         pad_lo = (pad_total + self.up_factor) // 2 # Shift sample locations according to the symmetric interpretation (Appendix C.3).
         pad_hi = pad_total - pad_lo
         self.padding = [int(pad_lo[0]), int(pad_hi[0]), int(pad_lo[1]), int(pad_hi[1])]
-        
+
 # !!! custom
     def forward(self, x, w, latmask, noise_mode='random', force_fp32=False, update_emas=False):
     # def forward(self, x, w, noise_mode='random', force_fp32=False, update_emas=False):
@@ -416,7 +416,7 @@ class SynthesisNetwork(torch.nn.Module):
         self.margin_size = margin_size
         self.output_scale = output_scale
         self.num_fp16_res = num_fp16_res
-        
+
         # Geometric progression of layer cutoffs and min. stopbands.
         last_cutoff = self.img_resolution / 2 # f_{c,N}
         last_stopband = last_cutoff * last_stopband_rel # f_{t,N}
@@ -431,7 +431,7 @@ class SynthesisNetwork(torch.nn.Module):
         sizes[-2:] = self.img_resolution
         channels = np.rint(np.minimum((channel_base / 2) / cutoffs, channel_max))
         channels[-1] = self.img_channels
-        
+
 # !!! custom
         # if verbose: print('sizes base', sizes)
         if size is None:
@@ -440,7 +440,7 @@ class SynthesisNetwork(torch.nn.Module):
             scale = np.array(size) / self.img_resolution
             sizes_custom = [[int(si) + self.margin_size * 2 for si in list(s * scale)] for s in sampling_rates]
         # if verbose: print('sizes custom', sizes_custom)
-        
+
         # Construct layers.
         self.input = SynthesisInput(
             w_dim=self.w_dim, channels=int(channels[0]), size=int(sizes[0]),
@@ -465,7 +465,7 @@ class SynthesisNetwork(torch.nn.Module):
             self.layer_names.append(name)
 
 # !!! custom
-    def forward(self, ws, latmask, trans_param=None, **layer_kwargs):
+    def forward(self, ws, latmask, trans_param=None, dconst=None, **layer_kwargs):
     # def forward(self, ws, **layer_kwargs):
         misc.assert_shape(ws, [None, self.num_ws, self.w_dim])
         ws = ws.to(torch.float32).unbind(dim=1)
@@ -473,6 +473,9 @@ class SynthesisNetwork(torch.nn.Module):
         # Execute layers.
 # !!! custom
         x = self.input(ws[0], trans_param=trans_param)
+# !!! custom
+        if dconst is not None:
+            x = x + dconst
         # x = self.input(ws[0])
         for name, w in zip(self.layer_names, ws[1:]):
 # !!! custom
@@ -487,7 +490,7 @@ class SynthesisNetwork(torch.nn.Module):
                 x = x[:, :, :self.size[0], :self.size[1]] # padside
             else:
             # if self.scale_type.lower() == 'pad':
-                x = x[:, :, self.margin_size:self.size[0]+self.margin_size, self.margin_size:self.size[1]+self.margin_size] # pad 
+                x = x[:, :, self.margin_size:self.size[0]+self.margin_size, self.margin_size:self.size[1]+self.margin_size] # pad
             # elif self.scale_type.lower() == 'padside':
 # !!! <<<
 
@@ -528,10 +531,9 @@ class Generator(torch.nn.Module):
         self.mapping = MappingNetwork(z_dim=z_dim, c_dim=c_dim, w_dim=w_dim, num_ws=self.num_ws, **mapping_kwargs)
 
 # !!! custom
-    def forward(self, z, c, latmask, trans_param, truncation_psi=1, truncation_cutoff=None, update_emas=False, **synthesis_kwargs):
+    def forward(self, z, c, latmask, trans_param, dconst, truncation_psi=1, truncation_cutoff=None, update_emas=False, **synthesis_kwargs):
     # def forward(self, z, c, truncation_psi=1, truncation_cutoff=None, update_emas=False, **synthesis_kwargs):
         ws = self.mapping(z, c, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff, update_emas=update_emas)
-        img = self.synthesis(ws, latmask, trans_param, update_emas=update_emas, **synthesis_kwargs) # !!! custom
+        img = self.synthesis(ws, latmask, trans_param, dconst, update_emas=update_emas, **synthesis_kwargs) # !!! custom
         # img = self.synthesis(ws, update_emas=update_emas, **synthesis_kwargs)
         return img
-

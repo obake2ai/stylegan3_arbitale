@@ -221,10 +221,35 @@ def generate(noise_seed):
     else:
         _ = Gs(latents[0], labels[0], noise_mode='const')
 
-    # Affine Convertion
+    # Affine Convertion ***not working ***
     if (a.affine_transform != [0.0, 0.0] or a.affine_scale != [1.0, 1.0] or a.affine_angle != 0.0):
         print("Applying Affine Convertion...")
         transform(Gs, a.affine_angle, a.affine_transform[0], a.affine_transform[1], a.affine_scale[0], a.affine_scale[1])
+
+    # distort image by tweaking initial const layer
+    first_layer_channels = Gs.synthesis.input.channels
+    first_layer_size     = Gs.synthesis.input.size
+    if isinstance(first_layer_size, (list, tuple, np.ndarray)):
+        h, w = first_layer_size[0], first_layer_size[1]
+    else:
+        h, w = first_layer_size, first_layer_size
+
+    shape_for_dconst = [1, first_layer_channels, h, w]
+    print("debug shape_for_dconst =", shape_for_dconst)
+
+    if a.digress != 0:
+        dconst_list = []
+        for i in range(n_mult):
+            dc_tmp = a.digress * latent_anima(
+                shape_for_dconst,  # [1, 1024, 36, 36] 等
+                a.frames, a.fstep, cubic=True, seed=noise_seed, verbose=False
+            )
+            dconst_list.append(dc_tmp)
+        dconst = np.concatenate(dconst_list, axis=1)
+    else:
+        dconst = np.zeros([latents.shape[0], 1, first_layer_channels, h, w])
+
+    dconst = torch.from_numpy(dconst).to(device).to(torch.float32)
 
     # Video Generation
     frame_count = latents.shape[0]
@@ -236,13 +261,15 @@ def generate(noise_seed):
         latent  = latents[frame_idx] # [X,512]
         label   = labels[frame_idx % len(labels)]
         latmask = lmask[frame_idx % len(lmask)] # [X,h,w] or None
+        dc      = dconst[frame_idx % len(dconst)] # [X,512,4,4]
+
         if hasattr(Gs.synthesis, 'input'): # SG3
             trans_param = trans_params[frame_idx % len(trans_params)]
 
         # generate multi-latent result
         if custom:
             if hasattr(Gs.synthesis, 'input'): # SG3
-                output = Gs(latent, label, latmask, trans_param, truncation_psi=a.trunc, noise_mode='const')
+                output = Gs(latent, label, latmask, trans_param, dc, truncation_psi=a.trunc, noise_mode='const')
             else: # SG2
                 output = Gs(latent, label, latmask, truncation_psi=a.trunc, noise_mode='const')
         else:
