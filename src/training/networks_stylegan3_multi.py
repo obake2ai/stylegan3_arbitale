@@ -649,6 +649,11 @@ class SynthesisNetwork(torch.nn.Module):
 
         # Execute layers.
         x = self.input(ws[0])
+
+# !!! custom
+        if dconst is not None:
+            x = x + dconst
+
         for name, w in zip(self.layer_names, ws[1:]):
 # !!! custom
             # print(name, latmask, dconst, layer_kwargs)
@@ -658,7 +663,6 @@ class SynthesisNetwork(torch.nn.Module):
 # !!! custom
         # Ensure correct shape and dtype.
         # misc.assert_shape(x, [None, self.img_channels, self.img_resolution, self.img_resolution])
-        x += dconst
         x = x.to(torch.float32)
         return x
 
