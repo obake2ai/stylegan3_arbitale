@@ -78,7 +78,7 @@ def make_out_name(a):
 
     model_name = basename(a.model)  # 例: 'models/ffhq-1024.pkl' → 'ffhq-1024.pkl'
 
-    out_name = f"{model_name}_seed{a.seed}"
+    out_name = f"{model_name}_seed{a.noise_seed}"
 
     if a.size is not None:
         out_name += f"_size{a.size[1]}x{a.size[0]}"
