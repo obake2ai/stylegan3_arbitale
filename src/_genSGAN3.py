@@ -41,6 +41,7 @@ parser.add_argument('-at', "--anim_trans", action='store_true', help="add transl
 parser.add_argument('-ar', "--anim_rot", action='store_true', help="add rotation animation")
 parser.add_argument('-sb', '--shiftbase', type=float, default=0., help='Shift to the tile center?')
 parser.add_argument('-sm', '--shiftmax',  type=float, default=0., help='Random walk around tile center')
+parser.add_argument('--digress', type=float, default=0, help='distortion technique by Aydao (strength of the effect)')
 #Affine Convertion
 parser.add_argument('--affine_angle', type=float, default=0.0)
 parser.add_argument('--affine_transform', default='0.0-0.0')
@@ -224,8 +225,6 @@ def generate(noise_seed):
     if (a.affine_transform != [0.0, 0.0] or a.affine_scale != [1.0, 1.0] or a.affine_angle != 0.0):
         print("Applying Affine Convertion...")
         transform(Gs, a.affine_angle, a.affine_transform[0], a.affine_transform[1], a.affine_scale[0], a.affine_scale[1])
-        out_name = out_name + "_affine_a%s_t%s-%s_s%s-%s"%(str(a.affine_angle).replace(".", "_"), str(a.affine_transform[0]).replace(".", "_"), str(a.affine_transform[1]).replace(".", "_"), str(a.affine_scale[0]).replace(".", "_"), str(a.affine_scale[1]).replace(".", "_"))
-
 
     # Video Generation
     frame_count = latents.shape[0]
