@@ -267,10 +267,8 @@ def generate(noise_seed):
     duration_sec = frame_count / 30
 
     # distort image by tweaking initial const layer
-    first_layer_channels = Gs.synthesis.input.channels  # 例: 1024
-    first_layer_size     = Gs.synthesis.input.size      # 例: [36, 36] (または単なる36)
-
-    print("debug", first_layer_channels, first_layer_size)
+    first_layer_channels = Gs.synthesis.input.channels
+    first_layer_size     = Gs.synthesis.input.size
 
     if isinstance(first_layer_size, (list, tuple, np.ndarray)):
         h, w = first_layer_size[0], first_layer_size[1]
@@ -280,7 +278,7 @@ def generate(noise_seed):
     shape_for_dconst = [1, first_layer_channels, h, w]
     print("debug shape_for_dconst =", shape_for_dconst)
 
-    if a.digress > 0:
+    if a.digress != 0:
         dconst_list = []
         for i in range(n_mult):
             dc_tmp = a.digress * latent_anima(
