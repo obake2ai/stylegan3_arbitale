@@ -269,9 +269,11 @@ def generate(noise_seed):
     # distort image by tweaking initial const layer
     first_layer_channels = Gs.synthesis.input.channels  # 例: 1024
     first_layer_size     = Gs.synthesis.input.size      # 例: 36
+    print("debug", first_layer_channels, first_layer_size)
 
     # 生成したい shape: [1, first_layer_channels, first_layer_size, first_layer_size]
     shape_for_dconst = [1, first_layer_channels, first_layer_size, first_layer_size]
+    print("debug", shape_for_dconst)
 
     if a.digress > 0:
         dconst_list = []
