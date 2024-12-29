@@ -292,7 +292,7 @@ def generate(noise_seed):
     else:
         dconst = np.zeros([frame_count, 1, first_layer_channels, h, w])
 
-    dconst = torch.from_numpy(dconst).to(device)
+    dconst = torch.from_numpy(dconst).to(device).to(torch.float32)
 
     # labels / conditions
     label_size = Gs.c_dim
