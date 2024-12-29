@@ -43,8 +43,6 @@ parser.add_argument('-sb', '--shiftbase', type=float, default=0., help='Shift to
 parser.add_argument('-sm', '--shiftmax',  type=float, default=0., help='Random walk around tile center')
 parser.add_argument('--digress', type=float, default=0, help='distortion technique by Aydao (strength of the effect)')
 #Affine Convertion
-parser.add_argument('--affine_angle', type=float, default=0.0)
-parser.add_argument('--affine_transform', default='0.0-0.0')
 parser.add_argument('--affine_scale', default='1.0-1.0')
 #Video Setting
 parser.add_argument('--framerate', default=30)
@@ -57,23 +55,7 @@ if a.size is not None:
     if len(a.size) == 1: a.size = a.size * 2
 [a.frames, a.fstep] = [int(s) for s in a.frames.split('-')]
 
-if a.affine_transform is not None: a.affine_transform = [float(s) for s in a.affine_transform.split('-')][::-1]
 if a.affine_scale is not None: a.affine_scale = [float(s) for s in a.affine_scale.split('-')][::-1]
-
-def transform(G, angle, tx, ty, sx, sy):
-    m = np.eye(3)
-    s = np.sin(angle/360.0*np.pi*2)
-    c = np.cos(angle/360.0*np.pi*2)
-
-    m[0][0] = sx*c
-    m[0][1] = sx*s
-    m[0][2] = tx
-    m[1][0] = -sy*s
-    m[1][1] = sy*c
-    m[1][2] = ty
-
-    m = np.linalg.inv(m)
-    G.synthesis.input.transform.copy_(torch.from_numpy(m))
 
 def make_out_name(a):
     def fmt_f(v):
@@ -223,11 +205,6 @@ def generate(noise_seed):
         scales = torch.from_numpy(scales).to(device)   # [frame_count, X, 2]
 
         trans_params = list(zip(shifts, angles, scales))
-
-    # Affine Convertion ***not working ***
-    if (a.affine_transform != [0.0, 0.0] or a.affine_scale != [1.0, 1.0] or a.affine_angle != 0.0):
-        print("Applying Affine Convertion...")
-        transform(Gs, a.affine_angle, a.affine_transform[0], a.affine_transform[1], a.affine_scale[0], a.affine_scale[1])
 
     # distort image by tweaking initial const layer
     first_layer_channels = Gs.synthesis.input.channels
