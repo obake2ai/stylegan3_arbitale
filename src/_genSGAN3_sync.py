@@ -267,16 +267,28 @@ def generate(noise_seed):
     duration_sec = frame_count / 30
 
     # distort image by tweaking initial const layer
+    first_layer_channels = Gs.synthesis.input.channels  # 例: 1024
+    first_layer_size     = Gs.synthesis.input.size      # 例: 36
+
+    # 生成したい shape: [1, first_layer_channels, first_layer_size, first_layer_size]
+    shape_for_dconst = [1, first_layer_channels, first_layer_size, first_layer_size]
+
     if a.digress > 0:
-        try: init_res = Gs.init_res
-        except: init_res = (4,4) # default initial layer size
-        dconst = []
+        dconst_list = []
         for i in range(n_mult):
-            dc_tmp = a.digress * latent_anima([1, Gs.z_dim, *init_res], a.frames, a.fstep, cubic=True, seed=noise_seed, verbose=False)
-            dconst.append(dc_tmp)
-        dconst = np.concatenate(dconst, 1)
+            # latent_anima() の引数を (C,H,W) = (first_layer_channels, first_layer_size, first_layer_size) に
+            # 変更することで 4x4 ではなく 36x36 でノイズを生成
+            dc_tmp = a.digress * latent_anima(
+                shape_for_dconst,  # これで [1, 1024, 36, 36] 相当を作る
+                a.frames, a.fstep, cubic=True, seed=noise_seed, verbose=False
+            )
+            dconst_list.append(dc_tmp)
+        # フレーム数方向などに応じて結合
+        dconst = np.concatenate(dconst_list, axis=1)
     else:
-        dconst = np.zeros([frame_count, 1, 1, 1, 1])
+        # digress=0 の場合はダミーゼロ
+        dconst = np.zeros([frame_count, 1, first_layer_channels, first_layer_size, first_layer_size])
+
     dconst = torch.from_numpy(dconst).to(device)
 
     # labels / conditions
