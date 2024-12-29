@@ -170,7 +170,7 @@ def generate(noise_seed):
     if a.size is None: a.size = [Gs.img_resolution] * 2
 
     if a.verbose is True: print(' making timeline..')
-    latents = latent_anima((n_mult, Gs.z_dim), a.frames, a.fstep, cubic=a.cubic, gauss=a.gauss, verbose=False) # [frm,X,512]
+    latents = latent_anima((n_mult, Gs.z_dim), a.frames, a.fstep, cubic=a.cubic, gauss=a.gauss, seed=a.noise_seed, verbose=False) # [frm,X,512]
     print(' latents', latents.shape)
     latents = torch.from_numpy(latents).to(device)
     frame_count = latents.shape[0]
@@ -199,12 +199,12 @@ def generate(noise_seed):
             xscale = [s / Gs.img_resolution for s in a.size]
             hw_centers = np.dstack((yy.flatten()[:n_mult], xx.flatten()[:n_mult])) * xscale * 0.5 * a.shiftbase
             hw_scales = np.array([2. / n for n in nHW]) * a.shiftmax
-            shifts = latent_anima((n_mult, 2), a.frames, a.fstep, uniform=True, cubic=a.cubic, gauss=a.gauss, verbose=False) # [frm,X,2]
+            shifts = latent_anima((n_mult, 2), a.frames, a.fstep, uniform=True, cubic=a.cubic, gauss=a.gauss, seed=a.noise_seed, verbose=False) # [frm,X,2]
             shifts = hw_centers + (shifts - 0.5) * hw_scales
         else:
             shifts = np.zeros((1, n_mult, 2))
         if a.anim_rot is True:
-            angles = latent_anima((n_mult, 1), a.frames, a.frames//4, uniform=True, cubic=a.cubic, gauss=a.gauss, verbose=False) # [frm,X,1]
+            angles = latent_anima((n_mult, 1), a.frames, a.frames//4, uniform=True, cubic=a.cubic, gauss=a.gauss, seed=a.noise_seed, verbose=False) # [frm,X,1]
             angles = (angles - 0.5) * 180.
         else:
             angles = np.zeros((1, n_mult, 1))
