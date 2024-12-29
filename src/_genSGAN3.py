@@ -82,12 +82,8 @@ def make_out_name(a):
     out_name += f"_sb{fmt_f(a.shiftbase)}"
     out_name += f"_sm{fmt_f(a.shiftmax)}"
     out_name += f"_digress{fmt_f(a.digress)}"
-    if (a.affine_angle != 0.0 or
-        a.affine_transform != [0.0, 0.0] or
-        a.affine_scale    != [1.0, 1.0]):
+    if a.affine_scale    != [1.0, 1.0]:
         out_name += "_affine"
-        out_name += f"_a{fmt_f(a.affine_angle)}"
-        out_name += f"_t{fmt_f(a.affine_transform[0])}-{fmt_f(a.affine_transform[1])}"
         out_name += f"_s{fmt_f(a.affine_scale[0])}-{fmt_f(a.affine_scale[1])}"
     out_name += f"_fps{a.framerate}"
 
