@@ -99,6 +99,7 @@ def make_out_name(a):
         out_name += "_ar"
     out_name += f"_sb{fmt_f(a.shiftbase)}"
     out_name += f"_sm{fmt_f(a.shiftmax)}"
+    out_name += f"_digress{fmt_f(a.digress)}"
     if (a.affine_angle != 0.0 or
         a.affine_transform != [0.0, 0.0] or
         a.affine_scale    != [1.0, 1.0]):
@@ -226,7 +227,7 @@ def generate(noise_seed):
         h, w = first_layer_size, first_layer_size
 
     shape_for_dconst = [1, first_layer_channels, h, w]
-    print("debug shape_for_dconst =", shape_for_dconst)
+    #("debug shape_for_dconst =", shape_for_dconst)
 
     if a.digress != 0:
         dconst_list = []
