@@ -111,27 +111,16 @@ def generate_images(
     label = torch.zeros([1, G.c_dim], device=device)
     if G.c_dim != 0:
         if class_idx is None:
-            # raise click.ClickException('Must specify class label with --class when using a conditional network')
           label[:, class_idx] = 1
     else:
         if class_idx is not None:
             print ('warn: --class=lbl ignored when running on an unconditional network')
     # Generate images.
-    #z = torch.from_numpy(np.random.RandomState(seed).randn(1, G.z_dim)).to(device)
     z = torch.randn(1, G.z_dim, device=device)
-    # Construct an inverse rotation/translation matrix and pass to the generator.  The
-    # generator expects this matrix as an inverse to avoid potentially failing numerical
-    # operations in the network.
-    # if hasattr(G.synthesis, 'input'):
-    #     m = make_transform(translate, rotate)
-    #     m = np.linalg.inv(m)
-    #     G.synthesis.input.transform.copy_(torch.from_numpy(m))
 
     img = G(z, label, truncation_psi=truncation_psi, noise_mode=noise_mode)
     img = (img.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
     PIL.Image.fromarray(img[0].cpu().numpy(), 'RGB').save(f'{outdir}/seed{seed:04d}.png')
-
-
 
 def get_noise_vectors(song, seed=None, tempo=0.5):
     import easydict
@@ -157,37 +146,14 @@ def get_noise_vectors(song, seed=None, tempo=0.5):
     })
     return analyzeSong(args)
 
-# def prune_module(name, module, mount):
-#     try:
-#         prune.random_unstructured(module, name='weight', amount=mount)
-#         #prune.ln_structured(module, name="weight", amount=mount)
-#         #print('{} : {}% pruned'.format(name,mount*100))
-#     except:
-#         pass
-#         #print('{} : skipped'.format(name))
-
-# def prune_layer(Gs, layer_name, prune_mount):
-#     for name, module in Gs.named_modules():
-#         if layer_name in name: prune_module(name, module, prune_mount)
-#     return Gs
-
 def custom_prune_unstructured(module, name='weight', amount=0.5, seed=None):
-    # シード値を固定
     torch.manual_seed(seed)
-
-    # 重みを取得
     tensor = getattr(module, name)
-
-    # 剪定する重みの数を計算
     total_params = tensor.nelement()
     prune_count = int(total_params * amount)
-
-    # 重みの総数に基づいてランダムなインデックスを生成
     mask = torch.ones_like(tensor)
     flat_indices = torch.randperm(total_params)[:prune_count]
     mask.view(-1)[flat_indices] = 0
-
-    # 重みを剪定
     tensor.data.mul_(mask)
 
 def prune_module(name, module, mount, seed=None):
@@ -225,13 +191,6 @@ Gs_kwargs.use_radial_filters = True # Use radially symmetric downsampling filter
 
 
 def generate(noise_seed):
-    # torch.manual_seed(a.noise_seed)
-    # if torch.cuda.is_available():
-    #     torch.cuda.manual_seed_all(a.noise_seed)
-    # np.random.seed(a.noise_seed)
-    # random.seed(a.noise_seed)
-    # os.makedirs(a.out_dir, exist_ok=True)
-
     torch.manual_seed(noise_seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(noise_seed)
@@ -339,21 +298,6 @@ def generate(noise_seed):
           for s in a.prune:
               if s in name:
                 prune_module(name, module, a.prune_val, noise_seed)
-          # print (name)
-          #prune_module(name, module, a.prune)
-          # # if 'L1_' in name: prune_module(name, module, a.prune)
-          # if 'L2_' in name: prune_module(name, module, a.prune_val)
-          # if 'L3_' in name: prune_module(name, module, a.prune_val)
-          # if 'L5_' in name: prune_module(name, module, 0.8*a.prune)
-          # if 'L7_' in name: prune_module(name, module, 0.8*a.prune)
-          # if 'L11_' in name: prune_module(name, module, 1.2*a.prune)
-          # if 'L13_' in name: prune_module(name, module, 1.2*a.prune)
-          # if 'L12_' in name: prune_module(name, module, 0.8*a.prune)
-          # if 'L14_' in name: prune_module(name, module, 1.2*a.prune)
-
-            #print (name, module)
-
-    #Gs = prune_layer(Gs, 'L1_', a.prune)
 
     if (a.affine_transform != [0.0, 0.0] or a.affine_scale != [1.0, 1.0] or a.affine_angle != 0.0):
         print("Applying Affine Convertion...")
@@ -368,10 +312,6 @@ def generate(noise_seed):
         latmask = lmask[frame_idx % len(lmask)] if lmask is not None else [None] # [X,h,w]
         dc      = dconst[frame_idx % len(dconst)] # [X,512,4,4]
 
-        # if a.custom:
-        #     images = prune_layer(Gs, 'L1_', a.prune)(latent, label, latmask, dc, truncation_psi=a.trunc, noise_mode='const')
-        # else:
-        #     images = prune_layer(Gs, 'L1_', a.prune)(latent, label, truncation_psi=a.trunc, noise_mode='const')
         if a.custom:
             images = Gs(latent, label, latmask, dc, truncation_psi=a.trunc, noise_mode='const')
         else:
