@@ -126,3 +126,9 @@ def shortime(sec):
         time_short = time_days(sec)
     return time_short
 
+try: # progress bar for notebooks 
+    get_ipython().__class__.__name__
+    progbar = ProgressIPy
+except: # normal console
+    progbar = ProgressBar
+

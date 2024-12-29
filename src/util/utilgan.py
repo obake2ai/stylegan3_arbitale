@@ -28,20 +28,33 @@ def load_latents(npy_file):
     except:
         pass
     idx_file = os.path.splitext(npy_file)[0] + '.txt'
-    if os.path.exists(idx_file):
+    if os.path.exists(idx_file): 
         with open(idx_file) as f:
             lat_idx = f.readline()
             lat_idx = [int(l.strip()) for l in lat_idx.split(',') if '\n' not in l and len(l.strip())>0]
         key_latents = [key_latents[i] for i in lat_idx]
     return np.asarray(key_latents)
 
-# = = = = = = = = = = = = = = = = = = = = = = = = = = =
+# = = = = = = = = = = = = = = = = = = = = = = = = = = = 
 
 def get_z(shape, rnd, uniform=False):
     if uniform:
         return rnd.uniform(0., 1., shape)
     else:
         return rnd.randn(*shape) # *x unpacks tuple/list to sequence
+
+def get_somehot(shape, count, seed=None, uniform=False):
+    if seed is None:
+        seed = np.random.seed(int((time.time()%1) * 9999))
+    rnd = np.random.RandomState(seed)
+    classes = np.zeros(shape, dtype=np.float32)
+    if uniform is True:
+        for i in range(shape[-1]):
+            classes[rnd.randint(shape[0]), i] = 1.
+    else:
+        for i in range(count):
+            classes[:, rnd.randint(shape[-1])] = 1.
+    return classes
 
 def smoothstep(x, NN=1., xmin=0., xmax=1.):
     N = math.ceil(NN)
@@ -53,7 +66,7 @@ def smoothstep(x, NN=1., xmin=0., xmax=1.):
     if NN != N: result = (x + result) / 2
     return result
 
-def lerp(z1, z2, num_steps, smooth=0.):
+def lerp(z1, z2, num_steps, smooth=0.): 
     vectors = []
     xs = [step / (num_steps - 1) for step in range(num_steps)]
     if smooth > 0: xs = [smoothstep(x, smooth) for x in xs]
@@ -79,59 +92,74 @@ def slerp(z1, z2, num_steps, smooth=0.):
         vectors.append(interpol_normal)
     return np.array(vectors)
 
-def cublerp(points, steps, fstep):
+def cublerp(points, steps, fstep, loop=True):
     keys = np.array([i*fstep for i in range(steps)] + [steps*fstep])
-    points = np.concatenate((points, np.expand_dims(points[0], 0)))
+    last_pt_num = 0 if loop is True else -1
+    points = np.concatenate((points, np.expand_dims(points[last_pt_num], 0)))
     cspline = CubSpline(keys, points)
     return cspline(range(steps*fstep+1))
 
-# = = = = = = = = = = = = = = = = = = = = = = = = = = =
-
-def latent_anima(shape, frames, transit, key_latents=None, smooth=0.5, cubic=False, gauss=False, seed=None, verbose=True):
+# = = = = = = = = = = = = = = = = = = = = = = = = = = = 
+    
+def latent_anima(shape, frames, transit, key_latents=None, somehot=None, smooth=0.5, uniform=False, cubic=False, gauss=False, seed=None, start_lat=None, loop=True, verbose=True):
     if key_latents is None:
-        transit = int(max(1, min(frames, transit)))
-    steps = max(1, int(frames // transit))
+        transit = int(max(1, min(frames//4, transit)))
+    steps = max(1, math.ceil(frames // transit))
     log = ' timeline: %d steps by %d' % (steps, transit)
 
     if seed is None:
         seed = np.random.seed(int((time.time()%1) * 9999))
     rnd = np.random.RandomState(seed)
-
+    
+    if somehot is not None: # amount of one-hot classes to mix (for biggan etc)
+        getlat = lambda : get_somehot(shape, count=somehot, seed=seed, uniform=uniform) # uniform for latmask, not for biggan etc
+    else:
+        getlat = lambda : get_z(shape, rnd, uniform)
+    
     # make key points
     if key_latents is None:
-        key_latents = np.array([get_z(shape, rnd) for i in range(steps)])
+        key_latents = np.array([getlat() for i in range(steps)])
+    if start_lat is not None:
+        key_latents[0] = start_lat
 
     latents = np.expand_dims(key_latents[0], 0)
-
+    
     # populate lerp between key points
     if transit == 1:
         latents = key_latents
     else:
         if cubic:
-            latents = cublerp(key_latents, steps, transit)
+            assert len(key_latents) == steps, ' Error: %d latents for %d steps' % (len(key_latents), steps)
+            latents = cublerp(key_latents, steps, transit, loop)
             log += ', cubic'
         else:
             for i in range(steps):
-                zA = key_latents[i]
-                zB = key_latents[(i+1) % steps]
-                interps_z = slerp(zA, zB, transit, smooth=smooth)
+                zA = key_latents[i % len(key_latents)]
+                lat_num = (i+1) % len(key_latents) if loop is True else min(i+1, len(key_latents)-1) # steps
+                zB = key_latents[lat_num]
+                if uniform is True:
+                    interps_z = lerp(zA, zB, transit, smooth=smooth)
+                else:
+                    interps_z = slerp(zA, zB, transit, smooth=smooth)  # proper ??
                 latents = np.concatenate((latents, interps_z))
     latents = np.array(latents)
-
+    
     if gauss:
         lats_post = gaussian_filter(latents, [transit, 0, 0], mode="wrap")
-        lats_post = (lats_post / np.linalg.norm(lats_post, axis=-1, keepdims=True)) * math.sqrt(np.prod(shape))
+        # lats_post = (lats_post / np.linalg.norm(lats_post, axis=-1, keepdims=True)) * math.sqrt(np.prod(shape))
+        lats_post *= math.sqrt(np.prod(shape))
         log += ', gauss'
         latents = lats_post
-
+        
     if verbose: print(log)
     if latents.shape[0] > frames: # extra frame
-        latents = latents[1:]
+        # latents = latents[1:]
+        latents = latents[:frames]
     return latents
-
-# = = = = = = = = = = = = = = = = = = = = = = = = = = =
-
-def multimask(x, size, latmask=None, countHW=[1,1], delta=0.):
+    
+# = = = = = = = = = = = = = = = = = = = = = = = = = = = 
+    
+def multimask(x, size, latmask=None, countHW=[1,1], delta=0., maxcount=None):
     Hx, Wx = countHW
     bcount = x.shape[0]
 
@@ -156,19 +184,23 @@ def multimask(x, size, latmask=None, countHW=[1,1], delta=0.):
         else: maskH = [1]
 
         mask = []
+        mm = 0
         for i in range(Wx):
             for j in range(Hx):
-                mask.append(maskW[i] * maskH[j])
-        mask = torch.cat(mask, 0).unsqueeze(1) # [xy,1,h,w]
-        mask = mask.to(x.device)
-        x = torch.sum(x[:Hx*Wx] * mask, 0, keepdim=True)
+                if maxcount is not None and mm >= maxcount: 
+                    mask[mm % maxcount] = mask[mm % maxcount] + maskW[i] * maskH[j]
+                else:
+                    mask.append(maskW[i] * maskH[j])
+                mm += 1
+        mask = torch.cat(mask, 0).unsqueeze(1).to(x.device) # [xy,1,h,w]
+        count = Hx*Wx if maxcount is None else maxcount
+        x = torch.sum(x[:count] * mask, 0, keepdim=True)
 
     elif latmask is not None:
         if len(latmask.shape) < 4:
             latmask = latmask.unsqueeze(1) # [b,1,h,w]
         lms = latmask.shape
         if list(lms[2:]) != list(size) and np.prod(lms) > 1:
-            latmask = latmask.float()
             latmask = F.interpolate(latmask, size) # , mode='nearest'
         latmask = latmask.type(x.dtype)
         x = torch.sum(x[:lms[0]] * latmask, 0, keepdim=True)
@@ -185,7 +217,7 @@ def peak_roll(width, count, num, delta):
         full_ax = torch.cat((peak(step, delta), fill_range), 0)
     else:
         full_ax = peak(step, delta)[:width]
-    if num == 0:
+    if num == 0: 
         shift = max(width - (step//2), 0.) # must be positive!
     else:
         shift = step*num - (step//2)
@@ -199,8 +231,8 @@ def peak(steps, delta):
     x = torch.clip(x, 0., 1.)
     return x # [steps*2,]
 
-# = = = = = = = = = = = = = = = = = = = = = = = = = = =
-
+# = = = = = = = = = = = = = = = = = = = = = = = = = = = 
+    
 def ups2d(x, factor=2):
     assert isinstance(factor, int) and factor >= 1
     if factor == 1: return x
@@ -216,7 +248,7 @@ def ups2d(x, factor=2):
 def tile_pad(xt, padding, symm=True):
     h, w = xt.shape[-2:]
     left, right, top, bottom = padding
-
+ 
     def tile(x, minx, maxx, symm=True):
         rng = maxx - minx
         if symm is True: # triangular reflection
@@ -255,7 +287,7 @@ def pad_up_to(x, size, type='centr'):
     return y
 
 # scale_type may include pad, side, symm
-def fix_size(x, size, scale_type='centr'):
+def fix_size(x, size, scale_type='centr'): 
     if not len(x.shape) == 4:
         raise Exception(" Wrong data rank, shape:", x.shape)
     if x.shape[2:] == size:
@@ -280,13 +312,12 @@ def fix_size(x, size, scale_type='centr'):
 def hw_scales(size, base, n, keep_first_layers=None, verbose=False):
     if isinstance(base, int): base = (base, base)
     start_res = [int(b * 2 ** (-n)) for b in base]
-
+    
     start_res[0] = int(start_res[0] * size[0] // base[0])
     start_res[1] = int(start_res[1] * size[1] // base[1])
-    start_res=[36,36]
 
     hw_list = []
-
+    
     if base[0] != base[1] and verbose is True:
         print(' size', size, 'base', base, 'start_res', start_res, 'n', n)
     if keep_first_layers is not None and keep_first_layers > 0:
@@ -294,7 +325,7 @@ def hw_scales(size, base, n, keep_first_layers=None, verbose=False):
             hw_list.append(start_res)
             start_res = [x*2 for x in start_res]
             n -= 1
-
+            
     ch = (size[0] / start_res[0]) ** (1/n)
     cw = (size[1] / start_res[1]) ** (1/n)
     for i in range(n):
@@ -310,7 +341,7 @@ def calc_res(shape):
     base1 = 2**int(np.log2(shape[1]))
     base = min(base0, base1)
     min_res = min(shape[0], shape[1])
-
+    
     def int_log2(xs, base):
         return [x * 2**(2-int(np.log2(base))) % 1 == 0 for x in xs]
     if min_res != base or max(*shape) / min(*shape) >= 2:
@@ -339,7 +370,7 @@ def file_list(path, ext=None, subdir=None):
         files = [os.path.join(dp, f) for dp, dn, fn in os.walk(path) for f in fn]
     else:
         files = [os.path.join(path, f) for f in os.listdir(path)]
-    if ext is not None:
+    if ext is not None: 
         if isinstance(ext, list):
             files = [f for f in files if os.path.splitext(f.lower())[1][1:] in ext]
         elif isinstance(ext, str):
@@ -366,7 +397,8 @@ def img_read(path):
     # 8bit to 256bit
     if (img.ndim == 2) or (img.shape[2] == 1):
         img = np.dstack((img,img,img))
-    # rgba to rgb
+    # rgba to rgb 
     if img.shape[2] == 4:
         img = img[:,:,:3]
     return img
+    

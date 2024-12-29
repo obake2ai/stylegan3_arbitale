@@ -1,4 +1,4 @@
-# Copyright (c) 2021, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2021, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
 #
 # NVIDIA CORPORATION and its licensors retain all intellectual property
 # and proprietary rights in and to this software, related documentation
@@ -15,9 +15,17 @@ from torch_utils.ops import upfirdn2d
 from torch_utils.ops import bias_act
 from torch_utils.ops import fma
 
-from .networks import FullyConnectedLayer, Conv2dLayer, ToRGBLayer, MappingNetwork
+from .networks_stylegan2 import FullyConnectedLayer, Conv2dLayer, ToRGBLayer, MappingNetwork
 
 from util.utilgan import hw_scales, fix_size, multimask
+
+#----------------------------------------------------------------------------
+
+@misc.profiled_function
+def normalize_2nd_moment(x, dim=1, eps=1e-8):
+    return x * (x.square().mean(dim=dim, keepdim=True) + eps).rsqrt()
+
+#----------------------------------------------------------------------------
 
 @misc.profiled_function
 def modulated_conv2d(
@@ -27,7 +35,8 @@ def modulated_conv2d(
 # !!! custom
     latmask,                      # mask for split-frame latents blending
     countHW         = [1,1],      # frame split count by height,width
-    splitfine       = 0.,         # frame split edge fineness (float from 0+)
+    delta           = 0.,         # frame split edge fineness (float from 0+)
+    splitmax        = None,       # max count of latents for frame splits (to avoid OOM)
     size            = None,       # custom size
     scale_type      = None,       # scaling way: fit, centr, side, pad, padside
     noise           = None,     # Optional noise tensor to add to the output activations.
@@ -68,7 +77,8 @@ def modulated_conv2d(
 # !!! custom size & multi latent blending
         if size is not None and up==2:
             x = fix_size(x, size, scale_type)
-            x = multimask(x, size, latmask, countHW, splitfine)
+        if (countHW != [1,1] or latmask is not None) and up==2:
+            x = multimask(x, x.shape[-2:], latmask, countHW, delta, splitmax)
         if demodulate and noise is not None:
             x = fma.fma(x, dcoefs.to(x.dtype).reshape(batch_size, -1, 1, 1), noise.to(x.dtype))
         elif demodulate:
@@ -88,7 +98,8 @@ def modulated_conv2d(
 # !!! custom size & multi latent blending
     if size is not None and up==2:
         x = fix_size(x, size, scale_type)
-        x = multimask(x, size, latmask, countHW, splitfine)
+    if (countHW != [1,1] or latmask is not None) and up==2:
+        x = multimask(x, x.shape[-2:], latmask, countHW, delta, splitmax)
     if noise is not None:
         x = x.add_(noise)
     return x
@@ -105,6 +116,7 @@ class SynthesisLayer(torch.nn.Module):
 # !!! custom
         countHW         = [1,1],      # frame split count by height,width
         splitfine       = 0.,         # frame split edge fineness (float from 0+)
+        splitmax        = None,       # max count of latents for frame splits (to avoid OOM)
         size            = None,       # custom size
         scale_type      = None,       # scaling way: fit, centr, side, pad, padside
         init_res        = [4,4],      # Initial (minimal) resolution for progressive training
@@ -117,9 +129,13 @@ class SynthesisLayer(torch.nn.Module):
         channels_last   = False,        # Use channels_last format for the weights?
     ):
         super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.w_dim = w_dim
         self.resolution = resolution
         self.countHW = countHW # !!! custom
         self.splitfine = splitfine # !!! custom
+        self.splitmax = splitmax # !!! custom
         self.size = size # !!! custom
         self.scale_type = scale_type # !!! custom
         self.init_res = init_res # !!! custom
@@ -141,12 +157,12 @@ class SynthesisLayer(torch.nn.Module):
             self.noise_strength = torch.nn.Parameter(torch.zeros([]))
         self.bias = torch.nn.Parameter(torch.zeros([out_channels]))
 
-# !!! custom
+# !!! custom 
     def forward(self, x, latmask, w, noise_mode='random', fused_modconv=True, gain=1):
     # def forward(self, x, w, noise_mode='random', fused_modconv=True, gain=1):
         assert noise_mode in ['random', 'const', 'none']
         in_resolution = self.resolution // self.up
-        # misc.assert_shape(x, [None, self.weight.shape[1], in_resolution, in_resolution])
+        # misc.assert_shape(x, [None, self.in_channels, in_resolution, in_resolution])
         styles = self.affine(w)
 
         noise = None
@@ -165,7 +181,7 @@ class SynthesisLayer(torch.nn.Module):
 
         flip_weight = (self.up == 1) # slightly faster
         x = modulated_conv2d(x=x, weight=self.weight, styles=styles, noise=noise, up=self.up,
-            latmask=latmask, countHW=self.countHW, splitfine=self.splitfine, size=self.size, scale_type=self.scale_type, # !!! custom
+            latmask=latmask, countHW=self.countHW, delta=self.splitfine, splitmax=self.splitmax, size=self.size, scale_type=self.scale_type, # !!! custom
             padding=self.padding, resample_filter=self.resample_filter, flip_weight=flip_weight, fused_modconv=fused_modconv)
 
         act_gain = self.act_gain * gain
@@ -173,27 +189,33 @@ class SynthesisLayer(torch.nn.Module):
         x = bias_act.bias_act(x, self.bias.to(x.dtype), act=self.activation, gain=act_gain, clamp=act_clamp)
         return x
 
+    def extra_repr(self):
+        return ' '.join([
+            f'in_channels={self.in_channels:d}, out_channels={self.out_channels:d}, w_dim={self.w_dim:d},',
+            f'resolution={self.resolution:d}, up={self.up}, activation={self.activation:s}'])
+
 #----------------------------------------------------------------------------
 
 @persistence.persistent_class
 class SynthesisBlock(torch.nn.Module):
     def __init__(self,
-        in_channels,                        # Number of input channels, 0 = first block.
-        out_channels,                       # Number of output channels.
-        w_dim,                              # Intermediate latent (W) dimensionality.
-        resolution,                         # Resolution of this block.
-        img_channels,                       # Number of output color channels.
-        is_last,                            # Is this the last block?
+        in_channels,                            # Number of input channels, 0 = first block.
+        out_channels,                           # Number of output channels.
+        w_dim,                                  # Intermediate latent (W) dimensionality.
+        resolution,                             # Resolution of this block.
+        img_channels,                           # Number of output color channels.
+        is_last,                                # Is this the last block?
 # !!! custom
         size                = None,       # custom size
         scale_type          = None,       # scaling way: fit, centr, side, pad, padside
         init_res            = [4,4],      # Initial (minimal) resolution for progressive training
-        architecture        = 'skip',       # Architecture: 'orig', 'skip', 'resnet'.
-        resample_filter     = [1,3,3,1],    # Low-pass filter to apply when resampling activations.
-        conv_clamp          = None,         # Clamp the output of convolution layers to +-X, None = disable clamping.
-        use_fp16            = False,        # Use FP16 for this block?
-        fp16_channels_last  = False,        # Use channels-last memory format with FP16?
-        **layer_kwargs,                     # Arguments for SynthesisLayer.
+        architecture            = 'skip',       # Architecture: 'orig', 'skip', 'resnet'.
+        resample_filter         = [1,3,3,1],    # Low-pass filter to apply when resampling activations.
+        conv_clamp              = 256,          # Clamp the output of convolution layers to +-X, None = disable clamping.
+        use_fp16                = False,        # Use FP16 for this block?
+        fp16_channels_last      = False,        # Use channels-last memory format with FP16?
+        fused_modconv_default   = True,         # Default value of fused_modconv. 'inference_only' = True for inference, False for training.
+        **layer_kwargs,                         # Arguments for SynthesisLayer.
     ):
         assert architecture in ['orig', 'skip', 'resnet']
         super().__init__()
@@ -208,6 +230,7 @@ class SynthesisBlock(torch.nn.Module):
         self.architecture = architecture
         self.use_fp16 = use_fp16
         self.channels_last = (use_fp16 and fp16_channels_last)
+        self.fused_modconv_default = fused_modconv_default
         self.register_buffer('resample_filter', upfirdn2d.setup_filter(resample_filter))
         self.num_conv = 0
         self.num_torgb = 0
@@ -238,15 +261,19 @@ class SynthesisBlock(torch.nn.Module):
                 resample_filter=resample_filter, channels_last=self.channels_last)
 
 # !!! custom
-    def forward(self, x, img, ws, latmask, dconst, force_fp32=False, fused_modconv=None, **layer_kwargs):
-    # def forward(self, x, img, ws, force_fp32=False, fused_modconv=None, **layer_kwargs):
+    def forward(self, x, img, ws, latmask, force_fp32=False, fused_modconv=None, update_emas=False, **layer_kwargs):
+    # def forward(self, x, img, ws, force_fp32=False, fused_modconv=None, update_emas=False, **layer_kwargs):
+        _ = update_emas # unused
         misc.assert_shape(ws, [None, self.num_conv + self.num_torgb, self.w_dim])
         w_iter = iter(ws.unbind(dim=1))
+        if ws.device.type != 'cuda':
+            force_fp32 = True
         dtype = torch.float16 if self.use_fp16 and not force_fp32 else torch.float32
         memory_format = torch.channels_last if self.channels_last and not force_fp32 else torch.contiguous_format
         if fused_modconv is None:
-            with misc.suppress_tracer_warnings(): # this value will be treated as a constant
-                fused_modconv = (not self.training) and (dtype == torch.float32 or int(x.shape[0]) == 1)
+            fused_modconv = self.fused_modconv_default
+        if fused_modconv == 'inference_only':
+            fused_modconv = (not self.training)
 
         # Input.
         if self.in_channels == 0:
@@ -256,8 +283,6 @@ class SynthesisBlock(torch.nn.Module):
             if 'side' in self.scale_type and 'symm' in self.scale_type: # looks better
                 const_size = self.init_res if self.size is None else self.size
                 x = fix_size(x, const_size, self.scale_type)
-# distortion technique from Aydao
-            x += dconst
         else:
             # misc.assert_shape(x, [None, self.in_channels, self.resolution // 2, self.resolution // 2])
             x = x.to(dtype=dtype, memory_format=memory_format)
@@ -287,16 +312,19 @@ class SynthesisBlock(torch.nn.Module):
 # !!! custom img size
             # misc.assert_shape(img, [None, self.img_channels, self.resolution // 2, self.resolution // 2])
             img = upfirdn2d.upsample2d(img, self.resample_filter)
-            img = fix_size(img, self.size, scale_type=self.scale_type)
+            img = fix_size(img, self.size, scale_type=self.scale_type) # !!! custom
 
         if self.is_last or self.architecture == 'skip':
             y = self.torgb(x, next(w_iter), fused_modconv=fused_modconv)
             y = y.to(dtype=torch.float32, memory_format=torch.contiguous_format)
             img = img.add_(y) if img is not None else y
 
-        assert x.dtype == dtype
-        assert img is None or img.dtype == torch.float32
+        # assert x.dtype == dtype
+        # assert img is None or img.dtype == torch.float32
         return x, img
+
+    def extra_repr(self):
+        return f'resolution={self.resolution:d}, architecture={self.architecture:s}'
 
 #----------------------------------------------------------------------------
 
@@ -312,7 +340,7 @@ class SynthesisNetwork(torch.nn.Module):
         scale_type      = None,       # scaling way: fit, centr, side, pad, padside
         channel_base    = 32768,    # Overall multiplier for the number of channels.
         channel_max     = 512,      # Maximum number of channels in any layer.
-        num_fp16_res    = 0,        # Use FP16 for the N highest resolutions.
+        num_fp16_res    = 4,        # Use FP16 for the N highest resolutions.
         verbose         = False,      #
         **block_kwargs,             # Arguments for SynthesisBlock.
     ):
@@ -320,13 +348,16 @@ class SynthesisNetwork(torch.nn.Module):
         super().__init__()
         self.w_dim = w_dim
         self.img_resolution = img_resolution
-        self.res_log2 = int(np.log2(img_resolution))
+        self.img_resolution_log2 = int(np.log2(img_resolution))
+        self.res_log2 = self.img_resolution_log2 # !!! custom
+        self.fmap_base = channel_base # !!! custom
         self.img_channels = img_channels
-        self.fmap_base = channel_base
+        self.num_fp16_res = num_fp16_res
         self.block_resolutions = [2 ** i for i in range(2, self.res_log2 + 1)]
         channels_dict = {res: min(channel_base // res, channel_max) for res in self.block_resolutions}
         fp16_resolution = max(2 ** (self.res_log2 + 1 - num_fp16_res), 8)
 
+# !!! custom
         # calculate intermediate layers sizes for arbitrary output resolution
         custom_res = (img_resolution * init_res[0] // 4, img_resolution * init_res[1] // 4)
         if size is None: size = custom_res
@@ -334,15 +365,17 @@ class SynthesisNetwork(torch.nn.Module):
             print(' .. init res', init_res, size)
         keep_first_layers = 2 if scale_type == 'fit' else None
         hws = hw_scales(size, custom_res, self.res_log2 - 2, keep_first_layers, verbose)
-        if verbose: print(hws, '..', custom_res, self.res_log2-1)
-
+        # if verbose: print(hws, '..', custom_res, self.res_log2-1)
+        
         self.num_ws = 0
+# !!! custom
         for i, res in enumerate(self.block_resolutions):
+        # for res in self.block_resolutions:
             in_channels = channels_dict[res // 2] if res > 4 else 0
             out_channels = channels_dict[res]
             use_fp16 = (res >= fp16_resolution)
             is_last = (res == self.img_resolution)
-            block = SynthesisBlock(in_channels, out_channels, w_dim=w_dim, resolution=res,
+            block = SynthesisBlock(in_channels, out_channels, w_dim=w_dim, resolution=res, 
                 init_res=init_res, scale_type=scale_type, size=hws[i], # !!! custom
                 img_channels=img_channels, is_last=is_last, use_fp16=use_fp16, **block_kwargs)
             self.num_ws += block.num_conv
@@ -350,7 +383,9 @@ class SynthesisNetwork(torch.nn.Module):
                 self.num_ws += block.num_torgb
             setattr(self, f'b{res}', block)
 
-    def forward(self, ws, latmask, dconst, **block_kwargs):
+# !!! custom
+    def forward(self, ws, latmask, **block_kwargs):
+    # def forward(self, ws, **block_kwargs):
         block_ws = []
         with torch.autograd.profiler.record_function('split_ws'):
             misc.assert_shape(ws, [None, self.num_ws, self.w_dim])
@@ -365,9 +400,15 @@ class SynthesisNetwork(torch.nn.Module):
         for res, cur_ws in zip(self.block_resolutions, block_ws):
             block = getattr(self, f'b{res}')
 # !!! custom
-            x, img = block(x, img, cur_ws, latmask, dconst, **block_kwargs)
+            x, img = block(x, img, cur_ws, latmask, **block_kwargs)
             # x, img = block(x, img, cur_ws, **block_kwargs)
         return img
+
+    def extra_repr(self):
+        return ' '.join([
+            f'w_dim={self.w_dim:d}, num_ws={self.num_ws:d},',
+            f'img_resolution={self.img_resolution:d}, img_channels={self.img_channels:d},',
+            f'num_fp16_res={self.num_fp16_res:d}'])
 
 #----------------------------------------------------------------------------
 
@@ -382,25 +423,28 @@ class Generator(torch.nn.Module):
 # !!! custom
         init_res            = [4,4],  # Initial (minimal) resolution for progressive training
         mapping_kwargs      = {},   # Arguments for MappingNetwork.
-        synthesis_kwargs    = {},   # Arguments for SynthesisNetwork.
+        **synthesis_kwargs,         # Arguments for SynthesisNetwork.
     ):
         super().__init__()
         self.z_dim = z_dim
         self.c_dim = c_dim
         self.w_dim = w_dim
         self.img_resolution = img_resolution
+        self.res = img_resolution # !!! custom
         self.init_res = init_res # !!! custom
         self.img_channels = img_channels
 # !!! custom
-        self.synthesis = SynthesisNetwork(w_dim=w_dim, img_resolution=img_resolution, init_res=init_res, img_channels=img_channels, **synthesis_kwargs) # !!! custom
+        self.synthesis = SynthesisNetwork(w_dim=w_dim, img_resolution=img_resolution, init_res=init_res, img_channels=img_channels, **synthesis_kwargs)
+        # self.synthesis = SynthesisNetwork(w_dim=w_dim, img_resolution=img_resolution, img_channels=img_channels, **synthesis_kwargs)
         self.num_ws = self.synthesis.num_ws
         self.mapping = MappingNetwork(z_dim=z_dim, c_dim=c_dim, w_dim=w_dim, num_ws=self.num_ws, **mapping_kwargs)
 # !!! custom
         self.output_shape = [1, img_channels, img_resolution * init_res[0] // 4, img_resolution * init_res[1] // 4]
 
 # !!! custom
-    def forward(self, z, c, latmask, dconst, truncation_psi=1, truncation_cutoff=None, **synthesis_kwargs):
-    # def forward(self, z, c, truncation_psi=1, truncation_cutoff=None, **synthesis_kwargs):
-        ws = self.mapping(z, c, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff)
-        img = self.synthesis(ws, latmask, dconst, **synthesis_kwargs) # !!! custom
+    def forward(self, z, c, latmask, truncation_psi=1, truncation_cutoff=None, update_emas=False, **synthesis_kwargs):
+    # def forward(self, z, c, truncation_psi=1, truncation_cutoff=None, update_emas=False, **synthesis_kwargs):
+        ws = self.mapping(z, c, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff, update_emas=update_emas)
+        img = self.synthesis(ws, latmask, update_emas=update_emas, **synthesis_kwargs) # !!! custom
         return img
+

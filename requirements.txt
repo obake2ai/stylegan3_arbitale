@@ -1,4 +1,4 @@
-click
+protobuf==3.20
 psutil
+click
 ninja
-

@@ -6,8 +6,6 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
-"""Loss functions."""
-
 import numpy as np
 import torch
 from torch_utils import training_stats
@@ -23,7 +21,9 @@ class Loss:
 #----------------------------------------------------------------------------
 
 class StyleGAN2Loss(Loss):
-    def __init__(self, device, G, D, augment_pipe=None, r1_gamma=10, style_mixing_prob=0, pl_weight=0, pl_batch_shrink=2, pl_decay=0.01, pl_no_weight_grad=False, blur_init_sigma=0, blur_fade_kimg=0):
+# !!! apa
+    def __init__(self, device, G, D, apa=False, augment_pipe=None, r1_gamma=10, style_mixing_prob=0, pl_weight=0, pl_batch_shrink=2, pl_decay=0.01, pl_no_weight_grad=False, blur_init_sigma=0, blur_fade_kimg=0): # style_mixing_prob=0.9, pl_weight=2
+    # def __init__(self, device, G, D, augment_pipe=None, r1_gamma=10, style_mixing_prob=0, pl_weight=0, pl_batch_shrink=2, pl_decay=0.01, pl_no_weight_grad=False, blur_init_sigma=0, blur_fade_kimg=0):
         super().__init__()
         self.device             = device
         self.G                  = G
@@ -38,6 +38,9 @@ class StyleGAN2Loss(Loss):
         self.pl_mean            = torch.zeros([], device=device)
         self.blur_init_sigma    = blur_init_sigma
         self.blur_fade_kimg     = blur_fade_kimg
+# !!! apa
+        self.apa = apa
+        self.pseudo_data = None
 
     def run_G(self, z, c, update_emas=False):
         ws = self.G.mapping(z, c, update_emas=update_emas)
@@ -55,10 +58,26 @@ class StyleGAN2Loss(Loss):
             with torch.autograd.profiler.record_function('blur'):
                 f = torch.arange(-blur_size, blur_size + 1, device=img.device).div(blur_sigma).square().neg().exp2()
                 img = upfirdn2d.filter2d(img, f / f.sum())
-        if self.augment_pipe is not None:
-            img = self.augment_pipe(img)
+# !!! avoid error with padding?
+        try:
+            if self.augment_pipe is not None:
+                img = self.augment_pipe(img)
+        except: 
+            print(' padding ?? augment error'); pass
         logits = self.D(img, c, update_emas=update_emas)
         return logits
+
+# !!! apa
+    def adaptive_pseudo_augmentation(self, real_img):
+        # Apply Adaptive Pseudo Augmentation (APA)
+        batch_size = real_img.shape[0]
+        pseudo_flag = torch.ones([batch_size, 1, 1, 1], device=self.device)
+        pseudo_flag = torch.where(torch.rand([batch_size, 1, 1, 1], device=self.device) < self.augment_pipe.p, pseudo_flag, torch.zeros_like(pseudo_flag))
+        if torch.allclose(pseudo_flag, torch.zeros_like(pseudo_flag)):
+            return real_img
+        else:
+            assert self.pseudo_data is not None
+            return self.pseudo_data * pseudo_flag + real_img * (1 - pseudo_flag)
 
     def accumulate_gradients(self, phase, real_img, real_c, gen_z, gen_c, gain, cur_nimg):
         assert phase in ['Gmain', 'Greg', 'Gboth', 'Dmain', 'Dreg', 'Dboth']
@@ -72,6 +91,10 @@ class StyleGAN2Loss(Loss):
         if phase in ['Gmain', 'Gboth']:
             with torch.autograd.profiler.record_function('Gmain_forward'):
                 gen_img, _gen_ws = self.run_G(gen_z, gen_c)
+# !!! apa
+                # Update pseudo data
+                if self.apa is True:
+                    self.pseudo_data = gen_img.detach()
                 gen_logits = self.run_D(gen_img, gen_c, blur_sigma=blur_sigma)
                 training_stats.report('Loss/scores/fake', gen_logits)
                 training_stats.report('Loss/signs/fake', gen_logits.sign())
@@ -115,7 +138,14 @@ class StyleGAN2Loss(Loss):
         if phase in ['Dmain', 'Dreg', 'Dboth']:
             name = 'Dreal' if phase == 'Dmain' else 'Dr1' if phase == 'Dreg' else 'Dreal_Dr1'
             with torch.autograd.profiler.record_function(name + '_forward'):
-                real_img_tmp = real_img.detach().requires_grad_(phase in ['Dreg', 'Dboth'])
+# !!! apa
+                # Apply Adaptive Pseudo Augmentation (APA) when --aug!='noaug'
+                if self.apa is True and self.augment_pipe is not None:
+                    real_img_tmp = self.adaptive_pseudo_augmentation(real_img)
+                else:
+                    real_img_tmp = real_img
+                real_img_tmp = real_img_tmp.detach().requires_grad_(phase in ['Dreg', 'Dboth'])
+                # real_img_tmp = real_img.detach().requires_grad_(phase in ['Dreg', 'Dboth'])
                 real_logits = self.run_D(real_img_tmp, real_c, blur_sigma=blur_sigma)
                 training_stats.report('Loss/scores/real', real_logits)
                 training_stats.report('Loss/signs/real', real_logits.sign())

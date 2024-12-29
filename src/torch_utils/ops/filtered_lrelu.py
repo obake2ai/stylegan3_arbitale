@@ -7,9 +7,10 @@
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
 import os
-import numpy as np
-import torch
 import warnings
+import numpy as np
+
+import torch
 
 from .. import custom_ops
 from .. import misc
@@ -22,13 +23,20 @@ _plugin = None
 
 def _init():
     global _plugin
+    # https://github.com/NVlabs/stylegan3/pull/45 !!! windows
+    # Bob Burrough's PR (#45) so that the plugins work in Windows: https://github.com/NVlabs/stylegan3/pull/45
+    # !! https://github.com/pytorch/pytorch/issues/53409#issuecomment-840104899
+    extras = {}
+    # if os.name == 'nt':
+        # extras['extra_cflags'] = ['/std:c++17'] 
     if _plugin is None:
         _plugin = custom_ops.get_plugin(
             module_name='filtered_lrelu_plugin',
             sources=['filtered_lrelu.cpp', 'filtered_lrelu_wr.cu', 'filtered_lrelu_rd.cu', 'filtered_lrelu_ns.cu'],
             headers=['filtered_lrelu.h', 'filtered_lrelu.cu'],
             source_dir=os.path.dirname(__file__),
-            extra_cuda_cflags=['--use_fast_math', '--allow-unsupported-compiler'],
+            extra_cuda_cflags=['--use_fast_math'],
+            **extras,
         )
     return True
 
@@ -214,8 +222,6 @@ def _filtered_lrelu_cuda(up=1, down=1, padding=0, gain=np.sqrt(2), slope=0.2, cl
             if x.dtype in [torch.float16, torch.float32]:
                 if torch.cuda.current_stream(x.device) != torch.cuda.default_stream(x.device):
                     warnings.warn("filtered_lrelu called with non-default cuda stream but concurrent execution is not supported", RuntimeWarning)
-                # print (fu.size(), fd.size(), up, down)
-                # print (fu, fd)
                 y, so, return_code = _plugin.filtered_lrelu(x, fu, fd, b, si, up, down, px0, px1, py0, py1, sx, sy, gain, slope, clamp, flip_filter, write_signs)
             else:
                 return_code = -1

@@ -16,7 +16,6 @@ import uuid
 
 import torch
 import torch.utils.cpp_extension
-from torch.utils.file_baton import FileBaton
 
 #----------------------------------------------------------------------------
 # Global options.
@@ -32,6 +31,10 @@ def _find_compiler_bindir():
         'C:/Program Files*/Microsoft Visual Studio/*/BuildTools/VC/Tools/MSVC/*/bin/Hostx64/x64',
         'C:/Program Files*/Microsoft Visual Studio/*/Community/VC/Tools/MSVC/*/bin/Hostx64/x64',
         'C:/Program Files*/Microsoft Visual Studio */vc/bin',
+        # 'C:/Program Files (x86)/Microsoft Visual Studio/*/Professional/VC/Tools/MSVC/*/bin/Hostx64/x64',
+        # 'C:/Program Files (x86)/Microsoft Visual Studio/*/BuildTools/VC/Tools/MSVC/*/bin/Hostx64/x64',
+        # 'C:/Program Files (x86)/Microsoft Visual Studio/*/Community/VC/Tools/MSVC/*/bin/Hostx64/x64',
+        # 'C:/Program Files (x86)/Microsoft Visual Studio */vc/bin',
     ]
     for pattern in patterns:
         matches = sorted(glob.glob(pattern))

@@ -23,6 +23,7 @@ parser.add_argument('--step', type=int, default=None, help='Step')
 parser.add_argument('--workers', type=int, default=8, help='number of workers (8, as of cpu#)')
 parser.add_argument('--png_compression', type=int, default=1, help='png compression (0 to 9; 0 = uncompressed, fast)')
 parser.add_argument('--jpg_quality', type=int, default=95, help='jpeg quality (0 to 100; 95 = max reasonable)')
+parser.add_argument('--down', action='store_true', help='downscale min side to size')
 a = parser.parse_args()
 
 # https://pillow.readthedocs.io/en/3.0.x/handbook/image-file-formats.html#jpeg
@@ -49,6 +50,10 @@ def worker(path, save_folder, crop_size, step, min_step):
 
     min_size = min(h,w)
     if min_size < crop_size:
+        h = int(h * crop_size/min_size)
+        w = int(w * crop_size/min_size)
+        img = cv2.resize(img, (w,h), interpolation = cv2.INTER_AREA)
+    if min_size > crop_size and a.down is True:
         h = int(h * crop_size/min_size)
         w = int(w * crop_size/min_size)
         img = cv2.resize(img, (w,h), interpolation = cv2.INTER_AREA)

@@ -1,423 +1,291 @@
-# Copyright (c) 2021, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2021, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# NVIDIA CORPORATION and its licensors retain all intellectual property
+# and proprietary rights in and to this software, related documentation
+# and any modifications thereto.  Any use, reproduction, disclosure or
+# distribution of this software and related documentation without an express
+# license agreement from NVIDIA CORPORATION is strictly prohibited.
+
 """Train a GAN using the techniques described in the paper
-"Training Generative Adversarial Networks with Limited Data"."""
+"Alias-Free Generative Adversarial Networks"."""
 
 import os
+import warnings
+warnings.filterwarnings("ignore")
 import click
 import re
 import json
 import tempfile
-from imageio import imread
-
 import torch
-from torch_utils import training_stats
-from torch_utils import custom_ops
 
 import dnnlib
 from training import training_loop
+from torch_utils import training_stats
+from torch_utils import custom_ops
 
-from util.utilgan import calc_init_res, basename, file_list
+#----------------------------------------------------------------------------
 
-class UserError(Exception):
-    pass
-
-def setup_training_loop_kwargs(
-    # data
-    data       = None, # Training dataset (required): <path>
-    resume     = None, # Load previous network: 'noresume' (default), 'ffhq256', 'ffhq512', 'ffhq1024', 'celebahq256', 'lsundog256', <file>, <url>
-    mirror     = None, # Augment dataset with x-flips: <bool>, default = False
-    cond       = None, # Train conditional model based on dataset labels: <bool>, default = False
-    # training
-    cfg        = None, # Base config: 'auto' (default), 'stylegan2', 'paper256', 'paper512', 'paper1024', 'cifar'
-    batch      = None, # Override batch size: <int>
-    kimg       = None, # Override training duration: <int>
-    snap       = None, # Snapshot interval: <int>, default = 5 ticks
-    gamma      = None, # Override R1 gamma: <float>
-    fmaps_fix  = None, # Set fmaps count as in original StyleGAN2: <bool>, default = False
-    freezed    = None, # Freeze-D: <int>, default = 0 discriminator layers
-    seed       = None, # Random seed: <int>, default = 0
-    # d augment
-    aug        = None, # Augmentation mode: 'ada' (default), 'apa', 'noaug', 'fixed'
-    p          = None, # Specify p for 'fixed' (required): <float>
-    target     = None, # Override ADA target for 'ada': <float>, default = depends on aug
-    augpipe    = None, # Augmentation pipeline: 'blit', 'geom', 'color', 'filter', 'noise', 'cutout', 'bg', 'bgc' (default), ..., 'bgcfnc'
-
-    # general & perf options 
-    gpus       = None, # Number of GPUs: <int>, default = 1 gpu
-    fp32       = None, # Disable mixed-precision training: <bool>, default = False
-    nhwc       = None, # Use NHWC memory format with FP16: <bool>, default = False
-    workers    = None, # Override number of DataLoader workers: <int>, default = 3
-    nobench    = None, # Disable cuDNN benchmarking: <bool>, default = False
-):
-    args = dnnlib.EasyDict()
-    args.G_kwargs = dnnlib.EasyDict(class_name='training.networks.Generator', z_dim=512, w_dim=512, mapping_kwargs=dnnlib.EasyDict(), synthesis_kwargs=dnnlib.EasyDict())
-    args.D_kwargs = dnnlib.EasyDict(class_name='training.networks.Discriminator', block_kwargs=dnnlib.EasyDict(), mapping_kwargs=dnnlib.EasyDict(), epilogue_kwargs=dnnlib.EasyDict())
-
-    # General options: gpus, snap, seed
-    # ------------------------------------------
-
-    assert (gpus >= 1 and gpus & (gpus - 1) == 0), '--gpus must be a power of two'
-    args.num_gpus = gpus
-
-    assert snap >= 1, '--snap must be at least 1'
-    args.image_snapshot_ticks = 1 * gpus if kimg <= 1000 else 4 * gpus
-    args.network_snapshot_ticks = snap
-
-    args.random_seed = seed
-
-    # Dataset: data, cond, subset, mirror
-    # -----------------------------------
-
-    assert data is not None
-    args.training_set_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=data, use_labels=True, max_size=None, xflip=False)
-    args.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=3, prefetch_factor=2)
-    try:
-        training_set = dnnlib.util.construct_class_by_name(**args.training_set_kwargs) # subclass of training.dataset.Dataset
-        args.training_set_kwargs.resolution = res = training_set.resolution # be explicit about resolution
-        args.training_set_kwargs.use_labels = training_set.has_labels # be explicit about labels
-        args.training_set_kwargs.max_size = len(training_set) # be explicit about dataset size
-# !!! custom init res
-        image_shape = training_set.image_shape
-        init_res = training_set.init_res
-        res_log2 = training_set.res_log2
-        desc = dataname = training_set.name
-        del training_set # conserve memory
-    except IOError as err:
-        raise UserError(f'--data: {err}')
-
-# !!! custom init res
-    if list(init_res) == [4,4]: 
-        desc += '-%d' % res
-    else:
-        print(' custom init resolution', init_res)
-        args.G_kwargs.init_res = args.D_kwargs.init_res = list(init_res)
-        desc += '-%dx%d' % (image_shape[2], image_shape[1])
-
-    args.savenames = [desc.replace(dataname, 'snapshot'), desc]
-
-    if cond:
-        if not args.training_set_kwargs.use_labels:
-            # raise UserError('--cond=True requires labels specified in dataset.json')
-            raise UserError(' put images in flat subdirectories for conditional training')
-        desc += '-cond'
-    else:
-        args.training_set_kwargs.use_labels = False
-
-    if mirror:
-        # desc += '-mirror'
-        args.training_set_kwargs.xflip = True
-
-    # Base config: cfg, gamma, kimg, batch
-    # ------------------------------------
-
-    desc += f'-{cfg}'
-    if gpus > 1: desc += f'{gpus:d}'
-
-    cfg_specs = {
-        'auto': dict(ramp=0.05, map=8),
-        'eps':  dict(lrate=0.001, ema=10, ramp=0.05, map=8), 
-        'big':  dict(mb=4, fmaps=1, lrate=0.002, gamma=10, ema=10, ramp=None, map=8), # aydao etc
-    }
-
-    if batch is None:
-        batch = max(min(4096//res, 32), 1) # from 1 to 32
-        # batch = max(min(3072//res, 32), 1) # for 11gb RAM
-
-    assert cfg in cfg_specs
-    spec = dnnlib.EasyDict(cfg_specs[cfg])
-    if cfg == 'auto':
-        spec.mb = min(batch * gpus, 64)
-        spec.fmaps = 1 if res >= 512 else 0.5
-        spec.lrate = 0.002 if res >= 1024 else 0.0025
-        spec.gamma = 0.0002 * (res ** 2) / spec.mb # heuristic formula
-        spec.ema = spec.mb * 10 / 32
-    elif cfg == 'eps':
-        spec.mb = min(batch * gpus, 64)
-        spec.fmaps = 1 if res >= 512 else 0.5
-        spec.gamma = 0.00001 * (res ** 2) / spec.mb # !!! my mb 3~4 instead of 32~64
-    spec.ref_gpus = gpus
-    spec.mbstd = spec.mb // gpus # min(spec.mb // gpus, 4) # other hyperparams behave more predictably if mbstd group size remains fixed
-    if fmaps_fix is True: spec.fmaps = 1
-
-    args.G_kwargs.synthesis_kwargs.channel_base = args.D_kwargs.channel_base = int(spec.fmaps * 32768) # TWICE MORE than sg2 on tf !!!
-    args.G_kwargs.synthesis_kwargs.channel_max = args.D_kwargs.channel_max = 512
-    args.G_kwargs.mapping_kwargs.num_layers = spec.map
-    args.G_kwargs.synthesis_kwargs.num_fp16_res = args.D_kwargs.num_fp16_res = 4 # enable mixed-precision training
-    args.G_kwargs.synthesis_kwargs.conv_clamp = args.D_kwargs.conv_clamp = 256 # clamp activations to avoid float16 overflow
-    args.D_kwargs.epilogue_kwargs.mbstd_group_size = spec.mbstd
-
-    args.G_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', lr=spec.lrate, betas=[0,0.99], eps=1e-8)
-    args.D_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', lr=spec.lrate, betas=[0,0.99], eps=1e-8)
-    args.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.StyleGAN2Loss', r1_gamma=spec.gamma)
-
-    args.total_kimg = kimg 
-    args.batch_size = spec.mb
-    args.batch_gpu = spec.mb // spec.ref_gpus
-    args.ema_kimg = spec.ema
-    args.ema_rampup = spec.ramp
-
-    """ from aydao [tf]
-    if 'div' in cfg: # for diverse datasets a la cifar
-        args.loss_args.pl_weight = 0 # disable path length regularization
-        args.G_args.style_mixing_prob = None # disable style mixing
-        args.D_args.architecture = 'orig' # disable residual skip connections
-
-    if cfg == 'big': # > 100k img
-        # disable path length and style mixing regularization
-        args.loss_args.pl_weight = 0
-        args.G_args.style_mixing_prob = None
-        # double generator capacity
-        args.G_kwargs.synthesis_kwargs.channel_base = args.D_kwargs.channel_base = 32 << 10 # if double for torch, should be 64 << 10 ??
-        args.G_kwargs.synthesis_kwargs.channel_max  = args.D_kwargs.channel_max  = 1024
-        # enable top k training
-        args.loss_args.G_top_k = True # drop bad samples
-        # args.loss_args.G_top_k_gamma = 0.99 # takes ~70% of full training from scratch to decay to 0.5
-        # args.loss_args.G_top_k_gamma = 0.9862 # takes 12500 kimg to decay to 0.5 (~1/2 of total_kimg when training from scratch)
-        args.loss_args.G_top_k_gamma = 0.9726 # takes 6250 kimg to decay to 0.5 (~1/4 of total_kimg when training from scratch)
-        args.loss_args.G_top_k_frac = 0.5
-        # reduce in-memory size, you need a BIG GPU for big model
-        args.batch_gpu = 4 # probably will need to set this pretty low with such a large G, higher values work better for top-k training though
-        args.G_kwargs.synthesis_kwargs.num_fp16_res = 6 # making more layers fp16 can help as well
-    """
-
-    if gamma is not None:
-        assert gamma >= 0, '--gamma must be non-negative'
-        desc += f'-gamma{gamma:g}'
-        args.loss_kwargs.r1_gamma = gamma
-
-    # Discriminator augmentation: aug, p, target, augpipe
-    # ---------------------------------------------------
-
-# !!! apa
-    if aug == 'apa':
-        args.apa = True
-
-    if aug != 'ada': desc += f'-{aug}'
-
-    if aug == 'ada' or aug == 'apa':
-        args.ada_target = 0.6
-    elif aug == 'noaug':
-        pass
-    elif aug == 'fixed':
-        if p is None:
-            raise UserError(f'--aug={aug} requires specifying --p')
-    else:
-        raise UserError(f'--aug={aug} not supported')
-
-    if p is not None:
-        assert aug == 'fixed', '--p can only be specified with --aug=fixed'
-        assert 0 <= p <= 1, '--p must be between 0 and 1'
-        desc += f'-p{p:g}'
-        args.augment_p = p
-
-    if target is not None:
-        assert aug == 'ada', '--target can only be specified with --aug=ada'
-        assert 0 <= target <= 1, '--target must be between 0 and 1'
-        desc += f'-target{target:g}'
-        args.ada_target = target
-
-    if augpipe is None and aug == 'noaug':
-        raise UserError('--augpipe cannot be specified with --aug=noaug')
-    desc += f'-{augpipe}'
-    args.augpipe = augpipe
-
-    augpipe_specs = {
-        'blit':   dict(xflip=1, rotate90=1, xint=1),
-        'geom':   dict(scale=1, rotate=1, aniso=1, xfrac=1),
-        'color':  dict(brightness=1, contrast=1, lumaflip=1, hue=1, saturation=1),
-        'filter': dict(imgfilter=1),
-        'noise':  dict(noise=1),
-        'cutout': dict(cutout=1),
-        'bg':     dict(xflip=1, rotate90=1, xint=1, scale=1, rotate=1, aniso=1, xfrac=1),
-        'bgc':    dict(xflip=1, rotate90=1, xint=1, scale=1, rotate=1, aniso=1, xfrac=1, brightness=1, contrast=1, lumaflip=1, hue=1, saturation=1),
-        'bgcf':   dict(xflip=1, rotate90=1, xint=1, scale=1, rotate=1, aniso=1, xfrac=1, brightness=1, contrast=1, lumaflip=1, hue=1, saturation=1, imgfilter=1),
-        'bgcfn':  dict(xflip=1, rotate90=1, xint=1, scale=1, rotate=1, aniso=1, xfrac=1, brightness=1, contrast=1, lumaflip=1, hue=1, saturation=1, imgfilter=1, noise=1),
-        'bgcfnc': dict(xflip=1, rotate90=1, xint=1, scale=1, rotate=1, aniso=1, xfrac=1, brightness=1, contrast=1, lumaflip=1, hue=1, saturation=1, imgfilter=1, noise=1, cutout=1),
-# !!!
-        'bgf_cnc':  dict(xflip=1, rotate90=1, xint=1, scale=1, rotate=1, aniso=1, xfrac=1, contrast=0.23, imgfilter=1, noise=0.11, cutout=0.11),
-        'gf_bnc':   dict(xflip=.5, xint=.5, scale=1, rotate=1, aniso=1, xfrac=1, rotate_max=.25, imgfilter=1, noise=.5, cutout=.5),
-    }
-
-    assert augpipe in augpipe_specs, ' unknown augpipe specs: %s' % augpipe
-    if aug != 'noaug':
-        args.augment_kwargs = dnnlib.EasyDict(class_name='training.augment.AugmentPipe', **augpipe_specs[augpipe])
-
-    # Transfer learning: resume, freezed
-    # ----------------------------------
-
-    resume_specs = {
-        'ffhq256':     'https://nvlabs-fi-cdn.nvidia.com/stylegan2-ada-pytorch/pretrained/transfer-learning-source-nets/ffhq-res256-mirror-paper256-noaug.pkl',
-        'ffhq512':     'https://nvlabs-fi-cdn.nvidia.com/stylegan2-ada-pytorch/pretrained/transfer-learning-source-nets/ffhq-res512-mirror-stylegan2-noaug.pkl',
-        'ffhq1024':    'https://nvlabs-fi-cdn.nvidia.com/stylegan2-ada-pytorch/pretrained/transfer-learning-source-nets/ffhq-res1024-mirror-stylegan2-noaug.pkl',
-        'celebahq256': 'https://nvlabs-fi-cdn.nvidia.com/stylegan2-ada-pytorch/pretrained/transfer-learning-source-nets/celebahq-res256-mirror-paper256-kimg100000-ada-target0.5.pkl',
-        'lsundog256':  'https://nvlabs-fi-cdn.nvidia.com/stylegan2-ada-pytorch/pretrained/transfer-learning-source-nets/lsundog-res256-paper256-kimg100000-noaug.pkl',
-    }
-
-    if resume is None:
-        pass
-    elif resume in resume_specs:
-        # desc += f'-resume{resume}'
-        args.resume_pkl = resume_specs[resume] # predefined url
-    else:
-        # desc += '-resumecustom'
-        args.resume_pkl = resume # custom path or url
-
-    if resume is not None:
-        args.ada_kimg = 100 # make ADA react faster at the beginning
-        args.ema_rampup = None # disable EMA rampup
-
-    if freezed is not None:
-        assert freezed >= 0, '--freezed must be non-negative'
-        desc += f'-freezed{freezed:d}'
-        args.D_kwargs.block_kwargs.freeze_layers = freezed
-
-    # Performance options: fp32, nhwc, nobench, workers
-    # -------------------------------------------------
-
-    if fp32:
-        args.G_kwargs.synthesis_kwargs.num_fp16_res = args.D_kwargs.num_fp16_res = 0
-        args.G_kwargs.synthesis_kwargs.conv_clamp = args.D_kwargs.conv_clamp = None
-
-    if nhwc:
-        args.G_kwargs.synthesis_kwargs.fp16_channels_last = args.D_kwargs.block_kwargs.fp16_channels_last = True
-
-    if nobench:
-        args.cudnn_benchmark = False
-
-    if workers is not None:
-        assert workers >= 1, '--workers must be at least 1'
-        args.data_loader_kwargs.num_workers = workers
-
-    return desc, args
-
-def subprocess_fn(rank, args, temp_dir):
-    dnnlib.util.Logger(file_name=os.path.join(args.run_dir, 'log.txt'), file_mode='a', should_flush=True)
+def subprocess_fn(rank, c, temp_dir):
+    dnnlib.util.Logger(file_name=os.path.join(c.run_dir, 'log.txt'), file_mode='a', should_flush=True)
 
     # Init torch.distributed.
-    if args.num_gpus > 1:
+    if c.num_gpus > 1:
         init_file = os.path.abspath(os.path.join(temp_dir, '.torch_distributed_init'))
         if os.name == 'nt':
             init_method = 'file:///' + init_file.replace('\\', '/')
-            torch.distributed.init_process_group(backend='gloo', init_method=init_method, rank=rank, world_size=args.num_gpus)
+            torch.distributed.init_process_group(backend='gloo', init_method=init_method, rank=rank, world_size=c.num_gpus)
         else:
             init_method = f'file://{init_file}'
-            torch.distributed.init_process_group(backend='nccl', init_method=init_method, rank=rank, world_size=args.num_gpus)
+            torch.distributed.init_process_group(backend='nccl', init_method=init_method, rank=rank, world_size=c.num_gpus)
 
     # Init torch_utils.
-    sync_device = torch.device('cuda', rank) if args.num_gpus > 1 else None
+    sync_device = torch.device('cuda', rank) if c.num_gpus > 1 else None
     training_stats.init_multiprocessing(rank=rank, sync_device=sync_device)
     if rank != 0:
         custom_ops.verbosity = 'none'
 
     # Execute training loop.
-    training_loop.training_loop(rank=rank, **args)
+    training_loop.training_loop(rank=rank, **c)
 
-class CommaSeparatedList(click.ParamType):
-    name = 'list'
-    def convert(self, value, param, ctx):
-        _ = param, ctx
-        if value is None or value.lower() == 'none' or value == '':
-            return []
-        return value.split(',')
+#----------------------------------------------------------------------------
 
-def _str_to_bool(v):
-    if isinstance(v, bool):
-        return v
-    if v.lower() in ('yes', 'true', 't', 'y', '1'):
-        return True
-    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
-        return False
-    else:
-        raise argparse.ArgumentTypeError('Boolean value expected.')
-
-@click.command()
-@click.pass_context
-@click.option('--train_dir', default='train', help='Root directory for training results [default: train]', metavar='DIR')
-# data
-@click.option('--data', help='Training data (directory or zip)', metavar='PATH', required=True)
-@click.option('--resume', help='Resume training [default: None]', metavar='PKL')
-@click.option('--mirror', default=True, type=_str_to_bool, help='Enable dataset x-flips [default: true]', metavar='BOOL')
-@click.option('--cond', is_flag=True, help='Train conditional model based on dataset labels [default: false]', metavar='BOOL')
-# training
-@click.option('--cfg', default='auto', help='Base config [default: auto]')
-@click.option('--batch', type=int, help='Override batch size (per GPU)', metavar='INT')
-@click.option('--kimg', type=int, help='Total training duration', metavar='INT')
-@click.option('--snap', default=5, type=int, help='Snapshot interval [default: 5 ticks]', metavar='INT')
-@click.option('--gamma', type=float, help='Override R1 gamma')
-@click.option('--fmaps_fix', is_flag=True, help='Fix fmaps count, as in original StyleGAN2', metavar='BOOL')
-@click.option('--freezed', type=int, help='Freeze-D [default: 0 layers]', metavar='INT')
-@click.option('--seed', default=0, type=int, help='Random seed [default: 0]', metavar='INT')
-# Discriminator augmentation.
-@click.option('--aug', default='apa', help='Augmentation mode [default: ada]', type=click.Choice(['noaug', 'ada', 'apa', 'fixed']))
-@click.option('--p', type=float, help='Augmentation probability for --aug=fixed')
-@click.option('--target', type=float, help='ADA target value for --aug=ada')
-# @click.option('--augpipe', default='bgc', help='Augmentation pipeline', type=click.Choice(['blit', 'geom', 'color', 'filter', 'noise', 'cutout', 'bg', 'bgc', 'bgcf', 'bgcfn', 'bgcfnc']))
-@click.option('--augpipe', default='gf_bnc', help='Augmentation pipeline')
-# misc perf
-@click.option('--gpus', default=1, help='Number of GPUs to use [default: 1]', type=int, metavar='INT')
-@click.option('--fp32', is_flag=True, help='Disable mixed-precision training', metavar='BOOL')
-@click.option('--nhwc', is_flag=True, help='Use NHWC memory format with FP16', metavar='BOOL')
-@click.option('--workers', type=int, help='Override number of DataLoader workers', metavar='INT')
-@click.option('--nobench', is_flag=True, help='Disable cuDNN benchmarking', metavar='BOOL')
-@click.option('-n', '--dry-run', is_flag=True, help='Print training options and exit')
-
-
-def main(ctx, train_dir, dry_run, **config_kwargs):
+def launch_training(c, desc, outdir, dry_run):
     dnnlib.util.Logger(should_flush=True)
-
-    # Setup training options.
-    try:
-        run_desc, args = setup_training_loop_kwargs(**config_kwargs)
-    except UserError as err:
-        ctx.fail(err)
 
     # Pick output directory.
     prev_run_dirs = []
-    if os.path.isdir(train_dir):
-        prev_run_dirs = [x for x in os.listdir(train_dir) if os.path.isdir(os.path.join(train_dir, x))]
+    if os.path.isdir(outdir):
+        prev_run_dirs = [x for x in os.listdir(outdir) if os.path.isdir(os.path.join(outdir, x))]
     prev_run_ids = [re.match(r'^\d+', x) for x in prev_run_dirs]
     prev_run_ids = [int(x.group()) for x in prev_run_ids if x is not None]
     cur_run_id = max(prev_run_ids, default=-1) + 1
-    args.run_dir = os.path.join(train_dir, f'{cur_run_id:03d}-{run_desc}')
-    assert not os.path.exists(args.run_dir)
+    c.run_dir = os.path.join(outdir, f'{cur_run_id:03d}-{desc}')
+    assert not os.path.exists(c.run_dir)
 
-    # print(' Training options:')
-    # print(json.dumps(args, indent=2))
-    print(' Train dir: ', args.run_dir)
-    print(' Dataset:   ', args.training_set_kwargs.path)
-    print(' Resolution:', args.training_set_kwargs.resolution)
-    print(' Batch:     ', args.batch_gpu)
-    print(' Length:     %d kimg' % args.total_kimg)
-    print(' Augment:   ', args.augpipe)
-    print(' Num images:', args.training_set_kwargs.max_size, '(+mirror)' if args.training_set_kwargs.xflip else '')
+    print(' Train dir: ', c.run_dir)
+    print(' Dataset:   ', c.training_set_kwargs.path)
+    print(' Resolution:', c.training_set_kwargs.resolution)
+    print(' Batch:     ', c.batch_size)
+    print(' Length:     %d kimg' % c.total_kimg)
+    print(' Data size: ', c.training_set_kwargs.max_size)
 
-    if args.training_set_kwargs.use_labels:
-        print(' Conditional model')
-    if args.num_gpus > 1:
-        print(' GPUs:       %d' % args.num_gpus)
     if dry_run:
         print('Dry run; exiting.')
         return
 
     # Create output directory.
-    os.makedirs(args.run_dir)
-    with open(os.path.join(args.run_dir, 'training_options.json'), 'wt') as f:
-        json.dump(args, f, indent=2)
+    os.makedirs(c.run_dir)
+    with open(os.path.join(c.run_dir, 'training_options.json'), 'wt') as f:
+        json.dump(c, f, indent=2)
 
     # Launch processes.
-    # print('Launching processes...')
     torch.multiprocessing.set_start_method('spawn')
     with tempfile.TemporaryDirectory() as temp_dir:
-        if args.num_gpus == 1:
-            subprocess_fn(rank=0, args=args, temp_dir=temp_dir)
+        if c.num_gpus == 1:
+            subprocess_fn(rank=0, c=c, temp_dir=temp_dir)
         else:
-            torch.multiprocessing.spawn(fn=subprocess_fn, args=(args, temp_dir), nprocs=args.num_gpus)
+            torch.multiprocessing.spawn(fn=subprocess_fn, args=(c, temp_dir), nprocs=c.num_gpus)
 
+#----------------------------------------------------------------------------
+
+def init_dataset_kwargs(opts):
+    try:
+        dataset_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=opts.data, use_labels=opts.cond, max_size=None, xflip=False)
+        dataset_obj = dnnlib.util.construct_class_by_name(**dataset_kwargs) # Subclass of training.dataset.Dataset.
+        dataset_kwargs.resolution = dataset_obj.resolution # Be explicit about resolution.
+        dataset_kwargs.use_labels = dataset_obj.has_labels # Be explicit about labels.
+        dataset_kwargs.max_size = len(dataset_obj) # Be explicit about dataset size.
+
+        img_shape = dataset_obj.image_shape
+        labels = dataset_obj.label_dim
+        
+        desc = dataset_obj.name
+        desc += '-%d' % dataset_kwargs.resolution
+        if opts.cfg == 'sg3r': desc += '-r'
+
+        savenames = [desc.replace(dataset_obj.name, 'snapshot'), desc]
+
+        if dataset_kwargs.use_labels and labels > 0:
+            desc += '-cond%d' % labels
+
+        # return dataset_kwargs, dataset_obj.name
+        return dataset_kwargs, desc, savenames
+    except IOError as err:
+        raise click.ClickException(f'--data: {err}')
+
+#----------------------------------------------------------------------------
+
+def parse_comma_separated_list(s):
+    if isinstance(s, list):
+        return s
+    if s is None or s.lower() == 'none' or s == '':
+        return []
+    return s.split(',')
+
+#----------------------------------------------------------------------------
+
+@click.command()
+
+# Required.
+@click.option('--train_dir', default='train', help='Root directory for training results [default: train]', metavar='DIR')
+# @click.option('--outdir',       help='Where to save the results', metavar='DIR',                required=True)
+@click.option('--cfg',          help='Base configuration',                                      type=click.Choice(['sg3t', 'sg3r', 'sg2']), required=True)
+@click.option('--data',         help='Training data', metavar='[ZIP|DIR]',                      type=str, required=True)
+@click.option('-b', '--batch',        help='Total batch size', metavar='INT',                         type=click.IntRange(min=1))
+@click.option('--gamma',        help='R1 regularization weight', metavar='FLOAT',               type=click.FloatRange(min=0), default=8) # my
+
+# Optional features.
+@click.option('--cond',         help='Train conditional model', metavar='BOOL',                 is_flag=True)
+@click.option('--mirror',       help='Enable dataset x-flips', metavar='BOOL',                  is_flag=True)
+@click.option('--aug',          help='Augmentation mode',                                       type=click.Choice(['apa', 'ada', 'fixed']), default='apa', show_default=True)
+@click.option('--resume',       help='Resume from given network pickle', metavar='[PATH|URL]',  type=str)
+@click.option('--freezed',      help='Freeze first layers of D', metavar='INT',                 type=click.IntRange(min=0), default=0, show_default=True)
+
+# Misc hyperparameters.
+@click.option('--p',            help='Probability for --aug=fixed', metavar='FLOAT',            type=click.FloatRange(min=0, max=1), default=0.2, show_default=True)
+@click.option('--target',       help='Target value for --aug=ada', metavar='FLOAT',             type=click.FloatRange(min=0, max=1), default=0.6, show_default=True)
+@click.option('--batch-gpu',    help='Limit batch size per GPU', metavar='INT',                 type=click.IntRange(min=1))
+@click.option('--cbase',        help='Capacity multiplier', metavar='INT',                      type=click.IntRange(min=1), default=32768, show_default=True)
+@click.option('--cmax',         help='Max. feature maps', metavar='INT',                        type=click.IntRange(min=1), default=512, show_default=True)
+@click.option('--lr',          help='learning rate [default: varies]', metavar='FLOAT',        type=click.FloatRange(min=0))
+# @click.option('--glr',          help='G learning rate [default: varies]', metavar='FLOAT',     type=click.FloatRange(min=0))
+# @click.option('--dlr',          help='D learning rate', metavar='FLOAT',                        type=click.FloatRange(min=0), default=0.002, show_default=True)
+@click.option('--map-depth',    help='Mapping network depth  [default: varies]', metavar='INT', type=click.IntRange(min=1))
+@click.option('--mbstd-group',  help='Minibatch std group size', metavar='INT',                 type=click.IntRange(min=1), default=4, show_default=True)
+
+# Misc settings.
+@click.option('--desc',         help='String to include in result dir name', metavar='STR',     type=str)
+@click.option('--kimg',         help='Total training duration', metavar='KIMG',                 type=click.IntRange(min=1), default=2000, show_default=True)
+@click.option('--tick',         help='How often to print progress', metavar='KIMG',             type=click.IntRange(min=1), default=2, show_default=True)
+@click.option('--snap',         help='How often to save snapshots', metavar='TICKS',            type=click.IntRange(min=1), default=5, show_default=True) # 50
+@click.option('--seed',         help='Random seed', metavar='INT',                              type=click.IntRange(min=0), default=0, show_default=True)
+@click.option('--fp32',         help='Disable mixed-precision', metavar='BOOL',                 is_flag=True)
+@click.option('--gpus',         help='Number of GPUs to use', metavar='INT',                    type=click.IntRange(min=1), default=1)
+@click.option('--nobench',      help='Disable cuDNN benchmarking', metavar='BOOL',              is_flag=True)
+@click.option('--workers',      help='DataLoader worker processes', metavar='INT',              type=click.IntRange(min=1), default=3, show_default=True)
+@click.option('-n','--dry-run', help='Print training options and exit',                         is_flag=True)
+
+def main(**kwargs):
+    """
+    # Fine-tune StyleGAN3-R for MetFaces-U on 1 GPU
+     --cfg=stylegan3-r --data=datasets/metfacesu-1024x1024.zip --gpus=8 --batch=32 --gamma=6.6 --mirror=1 --kimg=5000 --resume=stylegan3-r-ffhqu-1024x1024.pkl
+    # Train StyleGAN3-T for AFHQv2 on 8 GPUs
+     --cfg=stylegan3-t --data=datasets/afhqv2-512x512.zip --gpus=8 --batch=32 --gamma=8.2 --mirror=1
+    # Train StyleGAN2 for FFHQ on 8 GPUs
+     --cfg=stylegan2 --data=datasets/ffhq-1024x1024.zip --gpus=8 --batch=32 --gamma=10 --mirror=1 --aug=noaug
+    """
+
+    # Initialize config.
+    opts = dnnlib.EasyDict(kwargs) # Command line arguments.
+    c = dnnlib.EasyDict() # Main config dict.
+    c.G_kwargs = dnnlib.EasyDict(class_name=None, z_dim=512, w_dim=512, mapping_kwargs=dnnlib.EasyDict())
+    c.D_kwargs = dnnlib.EasyDict(class_name='training.networks_stylegan2.Discriminator', block_kwargs=dnnlib.EasyDict(), mapping_kwargs=dnnlib.EasyDict(), epilogue_kwargs=dnnlib.EasyDict())
+    c.G_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', betas=[0,0.99], eps=1e-8)
+    c.D_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', betas=[0,0.99], eps=1e-8)
+    c.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.StyleGAN2Loss')
+    c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, prefetch_factor=2)
+
+    # Training set.
+# !!!
+    c.training_set_kwargs, desc, c.savenames = init_dataset_kwargs(opts)
+    # c.training_set_kwargs, dataset_name = init_dataset_kwargs(data=opts.data)
+    res = c.training_set_kwargs.resolution
+
+    if opts.cond and not c.training_set_kwargs.use_labels:
+        raise click.ClickException('--cond=True requires labels specified in dataset.json')
+    c.training_set_kwargs.use_labels = opts.cond
+    c.training_set_kwargs.xflip = opts.mirror
+
+# !!!
+    if opts.batch is None:
+        opts.batch = 4 * 1024//res # for 512: 12 on 24gb, 8 on 16gb
+        opts.batch = max(min(opts.batch, min(32, 64//opts.gpus)), 1) # from 1 to 32 (single) or 64 (total multi)
+
+    # Hyperparameters & settings.
+    c.num_gpus = opts.gpus
+# !!!
+    c.batch_size = opts.batch
+    c.batch_gpu = opts.batch_gpu or opts.batch // opts.gpus
+
+    c.G_kwargs.channel_base = c.D_kwargs.channel_base = opts.cbase
+    c.G_kwargs.channel_max = c.D_kwargs.channel_max = opts.cmax
+    c.G_kwargs.mapping_kwargs.num_layers = (8 if opts.cfg == 'sg2' else 2) if opts.map_depth is None else opts.map_depth
+    c.D_kwargs.epilogue_kwargs.mbstd_group_size = opts.batch # min(opts.batch, opts.mbstd_group)
+    c.D_kwargs.block_kwargs.freeze_layers = opts.freezed
+    c.loss_kwargs.r1_gamma = opts.gamma
+    # gamma=5 is a safe choice. If training stable, diverse outputs = lower gamma. If training instability or mode collapse = increase gamma. 
+    # small batch size or large images => more regularization (higher gamma)!
+    c.G_opt_kwargs.lr = c.D_opt_kwargs.lr = (0.002 if opts.cfg == 'sg2' else 0.0025) if opts.lr is None else opts.lr
+# !!!
+    c.total_kimg = opts.kimg
+    c.kimg_per_tick = opts.gpus * opts.tick if opts.kimg <= 2000 else 2 * opts.gpus * opts.tick
+    c.image_snapshot_ticks = 1
+    c.network_snapshot_ticks = opts.snap
+
+    c.random_seed = c.training_set_kwargs.random_seed = opts.seed
+    c.data_loader_kwargs.num_workers = opts.workers
+
+    # Base configuration.
+# !!!
+    c.ema_kimg = 10
+    # c.ema_kimg = c.batch_size * 10 / 32
+    if opts.cfg == 'sg2':
+        c.G_kwargs.class_name = 'training.networks_stylegan2.Generator'
+        c.loss_kwargs.style_mixing_prob = 0.9 # Enable style mixing regularization.
+        c.loss_kwargs.pl_weight = 2 # Enable path length regularization.
+        c.G_reg_interval = 4 # Enable lazy regularization for G.
+        c.G_kwargs.fused_modconv_default = 'inference_only' # Speed up training by using regular convolutions instead of grouped convolutions.
+        c.loss_kwargs.pl_no_weight_grad = True # Speed up path length regularization by skipping gradient computation wrt. conv2d weights.
+    else:
+        c.G_kwargs.class_name = 'training.networks_stylegan3.Generator'
+        c.G_kwargs.magnitude_ema_beta = 0.5 ** (c.batch_size / (20 * 1e3))
+        if opts.cfg == 'sg3r':
+            c.G_kwargs.conv_kernel = 1 # Use 1x1 convolutions.
+            c.G_kwargs.channel_base *= 2 # Double the number of feature maps.
+            c.G_kwargs.channel_max *= 2
+            c.G_kwargs.use_radial_filters = True # Use radially symmetric downsampling filters.
+            c.loss_kwargs.blur_init_sigma = 10 # Blur the images seen by the discriminator.
+            c.loss_kwargs.blur_fade_kimg = c.batch_size * 200 / 32 # Fade out the blur during the first N kimg.
+
+    # Augmentation.
+    if opts.aug != 'noaug':
+# !!!
+        c.augment_kwargs = dnnlib.EasyDict(class_name='training.augment.AugmentPipe', xflip=.5, xint=.5, scale=1, rotate=1, aniso=1, xfrac=1, rotate_max=.25, imgfilter=1, noise=.5, cutout=.5)
+        # c.augment_kwargs = dnnlib.EasyDict(class_name='training.augment.AugmentPipe', xflip=1, rotate90=1, xint=1, scale=1, rotate=1, aniso=1, xfrac=1, brightness=1, contrast=1, lumaflip=1, hue=1, saturation=1)
+        if opts.aug == 'ada' or opts.aug == 'apa':
+            c.ada_target = opts.target
+        if opts.aug == 'fixed':
+            c.augment_p = opts.p
+
+# !!! apa
+    if opts.aug == 'apa':
+        c.apa = True
+
+    # Resume.
+    if opts.resume is not None:
+        c.resume_pkl = opts.resume
+        c.ada_kimg = 100 # Make ADA react faster at the beginning.
+        c.ema_rampup = None # Disable EMA rampup.
+        c.loss_kwargs.blur_init_sigma = 0 # Disable blur rampup.
+
+    # Performance-related toggles.
+    if opts.fp32:
+        c.G_kwargs.num_fp16_res = c.D_kwargs.num_fp16_res = 0
+        c.G_kwargs.conv_clamp = c.D_kwargs.conv_clamp = None
+    if opts.nobench:
+        c.cudnn_benchmark = False
+
+    # Description string.
+    # desc = f'{opts.cfg:s}-{dataset_name:s}-gpus{c.num_gpus:d}-batch{c.batch_size:d}-gamma{c.loss_kwargs.r1_gamma:g}'
+    if opts.desc is not None:
+        desc += f'-{opts.desc}'
+
+    # Launch.
+    launch_training(c=c, desc=desc, outdir=opts.train_dir, dry_run=opts.dry_run)
+
+#----------------------------------------------------------------------------
 
 if __name__ == "__main__":
-
-    # workaround for multithreading in jupyter console
-    __spec__ = "ModuleSpec(name='builtins', loader=<class '_frozen_importlib.BuiltinImporter'>)"
-
     main() # pylint: disable=no-value-for-parameter
 
+#----------------------------------------------------------------------------

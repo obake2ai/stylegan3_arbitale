@@ -52,7 +52,9 @@ class Dataset(torch.utils.data.Dataset):
 
     def _get_raw_labels(self):
         if self._raw_labels is None:
-            self._raw_labels = self._load_raw_labels() if self._use_labels else None
+# !!! cond dir labels
+            self._raw_labels = self._load_dir_labels() if self._use_labels else None
+            # self._raw_labels = self._load_raw_labels() if self._use_labels else None
             if self._raw_labels is None:
                 self._raw_labels = np.zeros([self._raw_shape[0], 0], dtype=np.float32)
             assert isinstance(self._raw_labels, np.ndarray)
@@ -70,6 +72,9 @@ class Dataset(torch.utils.data.Dataset):
         raise NotImplementedError
 
     def _load_raw_labels(self): # to be overridden by subclass
+        raise NotImplementedError
+
+    def _load_dir_labels(self): # to be overridden by subclass
         raise NotImplementedError
 
     def __getstate__(self):
@@ -221,6 +226,24 @@ class ImageFolderDataset(Dataset):
         image = image.transpose(2, 0, 1) # HWC => CHW
         return image
 
+# !!! cond dir labels
+    def _load_dir_labels(self):
+        dir_levels = {len(fname.replace('\\', '/').split('/')) for fname in self._image_fnames} # dict = unique only
+        if dir_levels == {2}:
+            print(' Dataset subdirs are set for labels')
+            dir_names = {fname.replace('\\', '/').split('/')[0] for fname in self._image_fnames} # dict = unique only
+            dir_labels = {}
+            for i, dir in enumerate(sorted(dir_names)):
+                dir_labels[dir] = i
+            all_dirs   = [fname.replace('\\', '/').split('/')[0] for fname in self._image_fnames] # list = for all files
+            labels = [dir_labels[d] for d in all_dirs]
+            # labels = [dir_labels[fname.replace('\\', '/').split('/')[0]] for fname in self._image_fnames] # oneliner
+            labels = np.array(labels)
+            labels = labels.astype({1: np.int64, 2: np.float32}[labels.ndim])
+            return labels
+        else:
+            return None 
+
     def _load_raw_labels(self):
         fname = 'dataset.json'
         if fname not in self._all_fnames:
@@ -235,4 +258,3 @@ class ImageFolderDataset(Dataset):
         labels = labels.astype({1: np.int64, 2: np.float32}[labels.ndim])
         return labels
 
-#----------------------------------------------------------------------------

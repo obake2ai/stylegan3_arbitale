@@ -1,9 +1,7 @@
------------------------ LICENSE FOR stylegan2-ada ---------------------
-
-Copyright (c) 2021, NVIDIA Corporation. All rights reserved.
+Copyright (c) 2021, NVIDIA Corporation & affiliates. All rights reserved.
 
 
-NVIDIA Source Code License for StyleGAN2 with Adaptive Discriminator Augmentation (ADA)
+NVIDIA Source Code License for StyleGAN3
 
 
 =======================================================================
