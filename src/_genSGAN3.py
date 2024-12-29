@@ -249,7 +249,7 @@ def generate(noise_seed):
             output = Gs(latent, label, truncation_psi=a.trunc, noise_mode='const')
         output = (output.permute(0,2,3,1) * 127.5 + 128).clamp(0, 255).to(torch.uint8).cpu().numpy()
 
-        return output
+        return output[0]
 
     if a.prores:
         moviepy.editor.VideoClip(make_frame, duration=duration_sec).write_videofile(
