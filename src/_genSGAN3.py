@@ -29,6 +29,7 @@ parser.add_argument('--splitmax', type=int, default=None, help='max count of lat
 parser.add_argument('--trunc', type=float, default=0.8, help='truncation psi 0..1 (lower = stable, higher = various)')
 parser.add_argument('--save_lat', action='store_true', help='save latent vectors to file')
 parser.add_argument('-v', '--verbose', action='store_true')
+parser.add_argument("--noise_seed", type=int, default=3025)
 # animation
 parser.add_argument('-f', '--frames', default='200-25', help='total frames to generate, length of interpolation step')
 parser.add_argument("--cubic", action='store_true', help="use cubic splines for smoothing")
@@ -38,21 +39,85 @@ parser.add_argument('-at', "--anim_trans", action='store_true', help="add transl
 parser.add_argument('-ar', "--anim_rot", action='store_true', help="add rotation animation")
 parser.add_argument('-sb', '--shiftbase', type=float, default=0., help='Shift to the tile center?')
 parser.add_argument('-sm', '--shiftmax',  type=float, default=0., help='Random walk around tile center')
+#Affine Convertion
+parser.add_argument('--affine_angle', type=float, default=0.0)
+parser.add_argument('--affine_transform', default='0.0-0.0')
+parser.add_argument('--affine_scale', default='1.0-1.0')
+#Video Setting
+parser.add_argument('--framerate', default=30)
+parser.add_argument('--prores', action='store_true', help='output video in ProRes format')
+
 a = parser.parse_args()
 
-if a.size is not None: 
+if a.size is not None:
     a.size = [int(s) for s in a.size.split('-')][::-1]
     if len(a.size) == 1: a.size = a.size * 2
 [a.frames, a.fstep] = [int(s) for s in a.frames.split('-')]
+
+if a.affine_transform is not None: a.affine_transform = [float(s) for s in a.affine_transform.split('-')][::-1]
+if a.affine_scale is not None: a.affine_scale = [float(s) for s in a.affine_scale.split('-')][::-1]
+
+def transform(G, angle, tx, ty, sx, sy):
+    m = np.eye(3)
+    s = np.sin(angle/360.0*np.pi*2)
+    c = np.cos(angle/360.0*np.pi*2)
+
+    m[0][0] = sx*c
+    m[0][1] = sx*s
+    m[0][2] = tx
+    m[1][0] = -sy*s
+    m[1][1] = sy*c
+    m[1][2] = ty
+
+    m = np.linalg.inv(m)
+    G.synthesis.input.transform.copy_(torch.from_numpy(m))
+
+def make_out_name(a):
+    def fmt_f(v):
+        return str(v).replace('.', '_')
+
+    model_name = basename(a.model)  # 例: 'models/ffhq-1024.pkl' → 'ffhq-1024.pkl'
+
+    out_name = f"{model_name}_seed{a.seed}"
+
+    if a.size is not None:
+        out_name += f"_size{a.size[1]}x{a.size[0]}"
+
+    out_name += f"_nXY{a.nXY}"
+    out_name += f"_trunc{fmt_f(a.trunc)}"
+    if a.cubic:
+        out_name += "_cubic"
+    if a.gauss:
+        out_name += "_gauss"
+    if a.anim_trans:
+        out_name += "_at"
+    if a.anim_rot:
+        out_name += "_ar"
+    out_name += f"_sb{fmt_f(a.shiftbase)}"
+    out_name += f"_sm{fmt_f(a.shiftmax)}"
+    if (a.affine_angle != 0.0 or
+        a.affine_transform != [0.0, 0.0] or
+        a.affine_scale    != [1.0, 1.0]):
+        out_name += "_affine"
+        out_name += f"_a{fmt_f(a.affine_angle)}"
+        out_name += f"_t{fmt_f(a.affine_transform[0])}-{fmt_f(a.affine_transform[1])}"
+        out_name += f"_s{fmt_f(a.affine_scale[0])}-{fmt_f(a.affine_scale[1])}"
+    out_name += f"_fps{a.framerate}"
+
+    return out_name
 
 def checkout(output, i):
     ext = 'png' if output.shape[3]==4 else 'jpg'
     filename = osp.join(a.out_dir, "%06d.%s" % (i,ext))
     imsave(filename, output[0], quality=95)
-    
-def generate():
+
+def generate(noise_seed):
+    torch.manual_seed(noise_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(noise_seed)
+    np.random.seed(noise_seed)
+    random.seed(noise_seed)
     os.makedirs(a.out_dir, exist_ok=True)
-    np.random.seed(seed=696)
     device = torch.device('cuda')
 
     # setup generator
@@ -72,7 +137,7 @@ def generate():
         if a.splitmax is not None: Gs_kwargs.splitmax = a.splitmax
         if a.verbose is True and n_mult > 1: print(' Latent blending w/split frame %d x %d' % (nHW[1], nHW[0]))
         lmask = [None]
-    
+
     else:
         n_mult = 2
         nHW = [1,1]
@@ -85,7 +150,7 @@ def generate():
         if a.verbose is True: print(' Latent blending with mask', a.latmask, lmask.shape)
         lmask = np.concatenate((lmask, 1 - lmask), 1) # [n,2,h,w]
         lmask = torch.from_numpy(lmask).to(device)
-    
+
     # load base or custom network
     pkl_name = osp.splitext(a.model)[0]
     if '.pkl' in a.model.lower():
@@ -105,7 +170,7 @@ def generate():
     print(' latents', latents.shape)
     latents = torch.from_numpy(latents).to(device)
     frame_count = latents.shape[0]
-    
+
     # labels / conditions
     label_size = Gs.c_dim
     if label_size > 0:
@@ -142,7 +207,7 @@ def generate():
         shifts = torch.from_numpy(shifts).to(device)
         angles = torch.from_numpy(angles).to(device)
         trans_params = list(zip(shifts, angles))
-        
+
     # warm up
     if custom:
         if hasattr(Gs.synthesis, 'input'): # SG3
@@ -151,16 +216,26 @@ def generate():
             _ = Gs(latents[0], labels[0], lmask[0], noise_mode='const')
     else:
         _ = Gs(latents[0], labels[0], noise_mode='const')
-    
-    # generate images from latent timeline
-    pbar = progbar(frame_count)
-    for i in range(frame_count):
-    
-        latent  = latents[i] # [X,512]
-        label   = labels[i % len(labels)]
-        latmask = lmask[i % len(lmask)] # [X,h,w] or None
+
+    # Affine Convertion
+    if (a.affine_transform != [0.0, 0.0] or a.affine_scale != [1.0, 1.0] or a.affine_angle != 0.0):
+        print("Applying Affine Convertion...")
+        transform(Gs, a.affine_angle, a.affine_transform[0], a.affine_transform[1], a.affine_scale[0], a.affine_scale[1])
+        out_name = out_name + "_affine_a%s_t%s-%s_s%s-%s"%(str(a.affine_angle).replace(".", "_"), str(a.affine_transform[0]).replace(".", "_"), str(a.affine_transform[1]).replace(".", "_"), str(a.affine_scale[0]).replace(".", "_"), str(a.affine_scale[1]).replace(".", "_"))
+
+
+    # Video Generation
+    frame_count = latents.shape[0]
+    duration_sec = frame_count / a.framerate
+    out_name = make_out_name(a)
+
+    def make_frame(t):
+        frame_idx = int(np.clip(np.round(t * 30), 0, frame_count - 1))
+        latent  = latents[frame_idx] # [X,512]
+        label   = labels[frame_idx % len(labels)]
+        latmask = lmask[frame_idx % len(lmask)] # [X,h,w] or None
         if hasattr(Gs.synthesis, 'input'): # SG3
-            trans_param = trans_params[i % len(trans_params)]
+            trans_param = trans_params[frame_idx % len(trans_params)]
 
         # generate multi-latent result
         if custom:
@@ -172,9 +247,45 @@ def generate():
             output = Gs(latent, label, truncation_psi=a.trunc, noise_mode='const')
         output = (output.permute(0,2,3,1) * 127.5 + 128).clamp(0, 255).to(torch.uint8).cpu().numpy()
 
-        # save image
-        checkout(output, i)
-        pbar.upd()
+        return output
+
+    if a.prores:
+        moviepy.editor.VideoClip(make_frame, duration=duration_sec).write_videofile(
+            osp.join(a.out_dir, "%s.mov" % out_name),
+            fps=a.framerate,
+            codec='prores',
+            bitrate='16M'
+        )
+    else:
+        moviepy.editor.VideoClip(make_frame, duration=duration_sec).write_videofile(
+            osp.join(a.out_dir, "%s.mp4" % out_name),
+            fps=a.framerate,
+            codec='libx264',
+            bitrate='16M'
+        )
+    # generate images from latent timeline
+    # pbar = progbar(frame_count)
+    # for i in range(frame_count):
+    #
+    #     latent  = latents[i] # [X,512]
+    #     label   = labels[i % len(labels)]
+    #     latmask = lmask[i % len(lmask)] # [X,h,w] or None
+    #     if hasattr(Gs.synthesis, 'input'): # SG3
+    #         trans_param = trans_params[i % len(trans_params)]
+    #
+    #     # generate multi-latent result
+    #     if custom:
+    #         if hasattr(Gs.synthesis, 'input'): # SG3
+    #             output = Gs(latent, label, latmask, trans_param, truncation_psi=a.trunc, noise_mode='const')
+    #         else: # SG2
+    #             output = Gs(latent, label, latmask, truncation_psi=a.trunc, noise_mode='const')
+    #     else:
+    #         output = Gs(latent, label, truncation_psi=a.trunc, noise_mode='const')
+    #     output = (output.permute(0,2,3,1) * 127.5 + 128).clamp(0, 255).to(torch.uint8).cpu().numpy()
+    #
+    #     # save image
+    #     checkout(output, i)
+    #     pbar.upd()
 
 
     if a.save_lat is True:
@@ -188,4 +299,4 @@ def generate():
 
 
 if __name__ == '__main__':
-    generate()
+    generate(a.noise_seed)
