@@ -47,6 +47,7 @@ parser.add_argument('--affine_scale', default='1.0-1.0')
 #Video Setting
 parser.add_argument('--framerate', default=30)
 parser.add_argument('--prores', action='store_true', help='output video in ProRes format')
+parser.add_argument('--variations', type=int, default=1)
 
 a = parser.parse_args()
 
@@ -313,4 +314,5 @@ def generate(noise_seed):
 
 
 if __name__ == '__main__':
-    generate(a.noise_seed)
+    for i in range(a.variations):
+        generate(a.noise_seed+i)
