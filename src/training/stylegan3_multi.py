@@ -27,7 +27,7 @@ from util.utilgan import fix_size, multimask
 
 # Construct an inverse rotation/translation matrix for generator.
 # generator expects inverse matrix to avoid potentially failing numerical operations in the network.
-def make_transform(translate: Tuple[float,float], angle: float, scale: Tuple[float, float],　invert=False):
+def make_transform(translate: Tuple[float,float], angle: float, scale: Tuple[float, float], invert=False):
     # print(translate)
     m = torch.eye(3)
     pi = torch.tensor(np.pi)
