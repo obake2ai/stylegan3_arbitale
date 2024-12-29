@@ -212,15 +212,6 @@ def generate(noise_seed):
         angles = torch.from_numpy(angles).to(device)
         trans_params = list(zip(shifts, angles))
 
-    # warm up
-    if custom:
-        if hasattr(Gs.synthesis, 'input'): # SG3
-            _ = Gs(latents[0], labels[0], lmask[0], trans_params[0], noise_mode='const')
-        else: # SG2
-            _ = Gs(latents[0], labels[0], lmask[0], noise_mode='const')
-    else:
-        _ = Gs(latents[0], labels[0], noise_mode='const')
-
     # Affine Convertion ***not working ***
     if (a.affine_transform != [0.0, 0.0] or a.affine_scale != [1.0, 1.0] or a.affine_angle != 0.0):
         print("Applying Affine Convertion...")
@@ -250,6 +241,15 @@ def generate(noise_seed):
         dconst = np.zeros([latents.shape[0], 1, first_layer_channels, h, w])
 
     dconst = torch.from_numpy(dconst).to(device).to(torch.float32)
+
+    # warm up
+    if custom:
+        if hasattr(Gs.synthesis, 'input'): # SG3
+            _ = Gs(latents[0], labels[0], lmask[0], trans_params[0], dconst[0], noise_mode='const')
+        else: # SG2
+            _ = Gs(latents[0], labels[0], lmask[0], noise_mode='const')
+    else:
+        _ = Gs(latents[0], labels[0], noise_mode='const')
 
     # Video Generation
     frame_count = latents.shape[0]
