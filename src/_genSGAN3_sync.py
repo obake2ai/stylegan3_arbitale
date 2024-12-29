@@ -218,6 +218,7 @@ def generate(noise_seed):
         if a.verbose is True: print(' latmask shape', lmask.shape)
         lmask = np.concatenate((lmask, 1 - lmask), 1) # [frm,2,h,w]
     lmask = torch.from_numpy(lmask).to(device)
+
     # load base or custom network
     pkl_name = osp.splitext(a.model)[0]
     if a.song is None:
@@ -228,20 +229,24 @@ def generate(noise_seed):
         song_name = os.path.basename(a.song).split(".")[0]
         tempo_name = str(a.tempo).replace(".","_")
         out_name = f"{model_name}_{noise_seed}_song{song_name}_tempo{tempo_name}"
+
     print(' .. Gs custom ..', basename(a.model))
     with dnnlib.util.open_url(pkl_name + '.pkl') as f:
         #print(Gs_kwargs)
         Gs = legacy.load_network_pkl(f, custom=a.custom, **Gs_kwargs)['G_ema'].to(device) # type: ignore
 
-    if a.verbose is True: print(' out shape', Gs.output_shape[1:])
+    if a.verbose is True:
+        print(' out shape', Gs.output_shape[1:])
+        print(' making timeline..')
 
-    if a.verbose is True: print(' making timeline..')
+    # 潜在変数の作成
     lats = [] # list of [frm,1,512]
     for i in range(n_mult):
         lat_tmp = latent_anima((1, Gs.z_dim), a.frames, a.fstep, cubic=a.cubic, gauss=a.gauss, seed=noise_seed, verbose=False) # [frm,1,512]
         lats.append(lat_tmp) # list of [frm,1,512]
         #print ("lat_tmp", lat_tmp.shape)
 
+    # songの入力があればlatsを初期化し、songのスペクトラムを取得
     if a.song is not None:
         lats = []
         if a.verbose is True: print(' making songline..')
@@ -255,9 +260,9 @@ def generate(noise_seed):
         out_name = out_name + "_%s_tempo%f"%(osp.basename(a.song).split(".")[0], a.tempo)
 
     latents = np.concatenate(lats, 1) # [frm,X,512]
-
     print(' latents', latents.shape)
     latents = torch.from_numpy(latents).to(device)
+
     frame_count = latents.shape[0]
     duration_sec = frame_count / 30
 
