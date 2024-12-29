@@ -1,3 +1,6 @@
+### memo
+* affineは今の所未対応
+
 # StyleGAN3 for practice
 
 <p align='center'><img src='_out/sg3-aia.jpg' /></p>
@@ -9,25 +12,25 @@ NB: If you're not familiar with StyleGAN use, you may want to check the previous
 ## Features
 * inference (image generation) in arbitrary resolution
 * multi-latent inference with split-frame or masked blending
-* examples of translating and rotating animation 
+* examples of translating and rotating animation
 * training with adaptive pseudo augmentation (APA) from [DeceiveD] (active by default)
 
 ## Training
 
-* Put your images in `data` as subfolder or zip archive. Ensure they all have the same color channels (monochrome, RGB or RGBA). 
+* Put your images in `data` as subfolder or zip archive. Ensure they all have the same color channels (monochrome, RGB or RGBA).
 If needed, first crop square fragments from `source` video or directory with images (feasible method, if you work with patterns or shapes, rather than compostions):
 ```
- multicrop.bat source 512 256 
+ multicrop.bat source 512 256
 ```
-This will cut every source image (or video frame) into 512x512px fragments, overlapped with 256px shift by X and Y. Result will be in directory `source-sub`, rename it as you wish. If you edit the images yourself, ensure their correct size. 
+This will cut every source image (or video frame) into 512x512px fragments, overlapped with 256px shift by X and Y. Result will be in directory `source-sub`, rename it as you wish. If you edit the images yourself, ensure their correct size.
 
 * Train StyleGAN3 with rotational invariance on the prepared dataset `mydata.zip` (in the `data` subfolder) for 8kk iterations:
 ```
  train.bat r mydata.zip 8000
 ```
-One can set `t` to train StyleGAN3 with translational invariance or `2` to train StyleGAN2, instead of `r`. 
+One can set `t` to train StyleGAN3 with translational invariance or `2` to train StyleGAN2, instead of `r`.
 
-This will run training process, according to the settings in `src/train.py` (check and explore those!!). Results (models and samples) are saved under the `train` directory, similar to original Nvidia approach. 
+This will run training process, according to the settings in `src/train.py` (check and explore those!!). Results (models and samples) are saved under the `train` directory, similar to original Nvidia approach.
 
 Please note: we save both compact models (containing only Gs network for inference) as `<dataset>-...pkl` (e.g. `mydata-512-r-0360.pkl`), and full models (containing G/D/Gs networks for further training) as `snapshot-...pkl`. The naming is for convenience only.
 
@@ -62,7 +65,7 @@ This will load `stylegan3-r-ffhq-1024x1024.pkl` from `models` directory and make
 ```
  gen.bat stylegan3-r-ffhq-1024x1024 1920-1080 100-20  -n 2-1 -at -ar -sb 0.5 -sm 0.2
 ```
-This will produce a blended composition of 2 independent frames, animated for both shifts (max 0.2) and rotations, with half-shifted centers of the frames. Argument `--splitfine X` would control the boundary fineness (0 = smoothest). 
+This will produce a blended composition of 2 independent frames, animated for both shifts (max 0.2) and rotations, with half-shifted centers of the frames. Argument `--splitfine X` would control the boundary fineness (0 = smoothest).
 
 * Check & explore other generation options:
 ```
@@ -72,8 +75,8 @@ This will produce a blended composition of 2 independent frames, animated for bo
 
 ## Credits
 
-StyleGAN3: 
-Copyright � 2021, NVIDIA Corporation & affiliates. All rights reserved.  
+StyleGAN3:
+Copyright � 2021, NVIDIA Corporation & affiliates. All rights reserved.  
 Made available under the [Nvidia Source Code License]  
 
 [StyleGAN3]: <https://github.com/NVlabs/stylegan3>
