@@ -14,6 +14,8 @@ from torch_utils import misc
 from util.utilgan import latent_anima, basename, img_read
 from util.progress_bar import progbar
 
+import moviepy.editor
+
 desc = "Customized StyleGAN3 on PyTorch"
 parser = argparse.ArgumentParser(description=desc)
 parser.add_argument('-o', '--out_dir', default='_out', help='output directory')
