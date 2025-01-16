@@ -312,7 +312,7 @@ def generate_realtime_local(a, noise_seed):
 
             with torch.no_grad():
                 # Mixed precision (オプション)
-                with torch.autocast("cuda", dtype=torch.float16):
+                with torch.autocast("cuda"):
                     if custom and hasattr(Gs.synthesis, 'input'):
                         out = Gs(z_current, label, latmask,
                                  trans_param, dconst_current,
