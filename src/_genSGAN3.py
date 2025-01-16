@@ -43,7 +43,7 @@ parser.add_argument('-sb', '--shiftbase', type=float, default=0., help='Shift to
 parser.add_argument('-sm', '--shiftmax',  type=float, default=0., help='Random walk around tile center')
 parser.add_argument('--digress', type=float, default=0, help='distortion technique by Aydao (strength of the effect)')
 #Affine Convertion
-parser.add_argument('--affine_scale', default='1.0-1.0')
+parser.add_argument('-as','--affine_scale', default='1.0-1.0')
 #Video Setting
 parser.add_argument('--framerate', default=30)
 parser.add_argument('--prores', action='store_true', help='output video in ProRes format')
