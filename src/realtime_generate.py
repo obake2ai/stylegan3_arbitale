@@ -21,6 +21,8 @@ import sys
 from IPython.display import display, clear_output
 from PIL import Image
 
+torch.backends.cudnn.benchmark = True
+
 desc = "Customized StyleGAN3 on PyTorch (リアルタイムプレビュー & Colab デモ版)"
 parser = argparse.ArgumentParser(description=desc)
 parser.add_argument('-o', '--out_dir', default='_out', help='output directory')
@@ -293,7 +295,7 @@ def generate_realtime_local(a, noise_seed):
         else:
             trans_param = None
 
-        with torch.no_grad():
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
             if custom and hasattr(Gs.synthesis, 'input'):
                 output = Gs(z_current, label, None,
                             trans_param, dconst_current,
