@@ -14,9 +14,10 @@ from torch_utils import misc
 from util.utilgan import latent_anima, basename, img_read, img_list
 from util.progress_bar import progbar
 
-# ----------- 追加: Colab の出力更新用 -----------
-import cv2  # ローカル用 (cv2.imshow を使用するリアルタイムプレビュー向け)
+# Colab or local preview
+import cv2
 import time
+import sys
 from IPython.display import display, clear_output
 from PIL import Image
 
@@ -37,7 +38,7 @@ parser.add_argument('--save_lat', action='store_true', help='save latent vectors
 parser.add_argument('-v', '--verbose', action='store_true')
 parser.add_argument("--noise_seed", type=int, default=3025)
 # animation
-parser.add_argument('-f', '--frames', default='200-25', help='total frames to generate, length of interpolation step')
+parser.add_argument('-f', '--frames', default='200-25', help='(未使用) total frames to generate, length of interpolation step')
 parser.add_argument("--cubic", action='store_true', help="use cubic splines for smoothing")
 parser.add_argument("--gauss", action='store_true', help="use Gaussian smoothing")
 # transform SG3
@@ -53,8 +54,12 @@ parser.add_argument('--framerate', default=30)
 parser.add_argument('--prores', action='store_true', help='output video in ProRes format')
 parser.add_argument('--variations', type=int, default=1)
 
-# ------------- Colab 用デモフラグ -------------
+# Colab 用デモフラグ
 parser.add_argument('--colab_demo', action='store_true', help='Colab上でサンプル動作をするモード')
+
+# 新規追加: 無限リアルタイム生成の方式を指定
+parser.add_argument('--method', default='smooth', choices=['smooth', 'random_walk'],
+                    help='smooth: latent_animaを使ったなめらかな無限補間, random_walk: 毎フレーム少し乱数を足す。')
 
 def img_resize_for_cv2(img):
     """
@@ -96,7 +101,7 @@ def make_out_name(a):
     out_name += f"_sb{fmt_f(a.shiftbase)}"
     out_name += f"_sm{fmt_f(a.shiftmax)}"
     out_name += f"_digress{fmt_f(a.digress)}"
-    if a.affine_scale != [1.0, 1.0]:
+    if a.affine_scale is not None and a.affine_scale != [1.0, 1.0]:
         out_name += "_affine"
         out_name += f"_s{fmt_f(a.affine_scale[0])}-{fmt_f(a.affine_scale[1])}"
     out_name += f"_fps{a.framerate}"
@@ -111,259 +116,85 @@ def checkout(output, i, out_dir):
     filename = osp.join(out_dir, "%06d.%s" % (i, ext))
     imsave(filename, output[0], quality=95)
 
-def setup_generator(a, noise_seed=0):
+# -------------------------------------------------------
+# ▼ もともとの latent_anima 関数 (util.utilgan 側) を再掲
+#   今回は外部から参照するだけなのでコピーは不要ですが、
+#   動作イメージのため、ユーザ要望に沿って貼り付け。
+#
+# def latent_anima(shape, frames, transit, key_latents=None, somehot=None, smooth=0.5,
+#                  uniform=False, cubic=False, gauss=False, seed=None, start_lat=None,
+#                  loop=True, verbose=True):
+#     ...
+#     return latents
+# -------------------------------------------------------
+
+
+# =============================================
+# 1) スムース (latent_anima) を無限に返すジェネレータ
+# =============================================
+def infinite_latent_smooth(z_dim, device, cubic=False, gauss=False, seed=None,
+                           chunk_size=30, uniform=False):
     """
-    生成に必要な前処理(ネットワーク読み込み・潜在ベクトル/パラメータ生成など)を行い、
-    後段の描画ループで使うオブジェクトをまとめて返す。
+    latent_anima を使って「2つの潜在ベクトル間を補間するフレームをchunk_size生成」→
+    次の区間へ移るときに新しいランダム潜在ベクトルを用意→… と繰り返し、
+    無限に潜在ベクトルをyieldするジェネレータ。
     """
+    rng = np.random.RandomState(seed) if seed is not None else np.random
+    lat1 = rng.randn(z_dim)
+    while True:
+        lat2 = rng.randn(z_dim)
+        key_latents = np.stack([lat1, lat2], axis=0)  # (2, z_dim)
 
-    torch.manual_seed(noise_seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(noise_seed)
-    np.random.seed(noise_seed)
-    random.seed(noise_seed)
-    os.makedirs(a.out_dir, exist_ok=True)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # latent_anima で chunk_size 個分の補間を生成
+        # transit=chunk_size, frames=chunk_size, loop=False → 1区間分を単純slerp or cubic
+        latents_np = latent_anima(
+            shape=(z_dim,),
+            frames=chunk_size,
+            transit=chunk_size,
+            key_latents=key_latents,
+            somehot=None,
+            smooth=0.5,
+            uniform=uniform,  # Trueにすると lerp, Falseにすると slerp
+            cubic=cubic,
+            gauss=gauss,
+            seed=None,
+            start_lat=None,
+            loop=False,
+            verbose=False
+        )  # shape=(chunk_size, z_dim)
 
-    # フレーム数と補間ステップ数
-    frames_str = a.frames.split('-')
-    if len(frames_str) == 2:
-        a.frames, a.fstep = [int(s) for s in frames_str]
-    else:
-        # "-f 200" のように1つだけ渡された場合の簡易処理
-        a.frames = int(frames_str[0])
-        a.fstep = 25  # 適当に固定
+        # 今区間で生成されたフレームを1つずつyield
+        for i in range(len(latents_np)):
+            yield torch.from_numpy(latents_np[i]).unsqueeze(0).to(device)  # (1, z_dim)
+        # 次のループでは lat2 から 新しいlat3 へ補間
+        lat1 = lat2
 
-    # サイズ設定
-    if a.size is not None:
-        a.size = [int(s) for s in a.size.split('-')][::-1]
-        if len(a.size) == 1:
-            a.size = a.size * 2
 
-    # Affineスケール
-    if a.affine_scale is not None:
-        a.affine_scale = [float(s) for s in a.affine_scale.split('-')][::-1]
-        if len(a.affine_scale) == 1:
-            a.affine_scale = a.affine_scale * 2
-
-    # ネットワーク呼び出し用の設定
-    Gs_kwargs = dnnlib.EasyDict()
-    Gs_kwargs.verbose = a.verbose
-    Gs_kwargs.size = a.size
-    Gs_kwargs.scale_type = a.scale_type
-
-    # latentマスク設定 (今回は簡略)
-    if a.latmask is None:
-        nHW = [int(s) for s in a.nXY.split('-')][::-1]
-        assert len(nHW) == 2, ' Wrong count nXY: %d (must be 2)' % len(nHW)
-        n_mult = nHW[0] * nHW[1]
-        if a.splitmax is not None:
-            n_mult = min(n_mult, a.splitmax)
-        Gs_kwargs.countHW = nHW
-        Gs_kwargs.splitfine = a.splitfine
-        if a.splitmax is not None:
-            Gs_kwargs.splitmax = a.splitmax
-        if a.verbose and n_mult > 1:
-            print(' Latent blending w/split frame %d x %d' % (nHW[1], nHW[0]))
-        lmask = [None]
-    else:
-        print(' !! Blending mask is not fully implemented in this example !!')
-        lmask = [None]
-        nHW = [1,1]
-        n_mult = 1
-
-    # ネットワークを読み込み
-    pkl_name = osp.splitext(a.model)[0]
-    if '.pkl' in a.model.lower():
-        custom = False
-        print(' .. Gs from pkl ..', basename(a.model))
-    else:
-        custom = True
-        print(' .. Gs custom ..', basename(a.model))
-
-    rot = True if ('-r-' in a.model.lower() or 'sg3r-' in a.model.lower()) else False
-    with dnnlib.util.open_url(pkl_name + '.pkl') as f:
-        Gs = legacy.load_network_pkl(f, custom=custom, rot=rot, **Gs_kwargs)['G_ema'].to(device)  # type: ignore
-
-    if a.size is None:
-        a.size = [Gs.img_resolution] * 2
-
-    # 潜在ベクトル
-    latents_np = latent_anima(
-        (n_mult, Gs.z_dim), a.frames, a.fstep,
-        cubic=a.cubic, gauss=a.gauss,
-        seed=noise_seed, verbose=False
-    )  # shape = [frame_count, n_mult, z_dim]
-    latents = torch.from_numpy(latents_np).to(device)
-    frame_count = latents.shape[0]
-
-    # ラベル（条件付け）
-    label_size = Gs.c_dim
-    if label_size > 0:
-        labels = torch.zeros((frame_count, n_mult, label_size), device=device)
-        if a.labels is None:
-            label_ids = []
-            for i in range(n_mult):
-                label_ids.append(random.randint(0, label_size - 1))
-        else:
-            label_ids = [int(x) for x in str(a.labels).split('-')]
-            label_ids = label_ids[:n_mult]
-        for i, l_ in enumerate(label_ids):
-            labels[:, i, l_] = 1
-    else:
-        labels = [None]
-
-    # SG3のアニメ用パラメータ(平行移動・回転・スケールなど)
-    if hasattr(Gs.synthesis, 'input'):
-        if a.anim_trans is True:
-            hw_centers = [np.linspace(-1+1/n, 1-1/n, n) for n in nHW]
-            yy, xx = np.meshgrid(*hw_centers)
-            xscale = [s / Gs.img_resolution for s in a.size]
-            hw_centers = np.dstack((yy.flatten()[:n_mult], xx.flatten()[:n_mult])) * xscale * 0.5 * a.shiftbase
-            hw_scales = np.array([2. / n for n in nHW]) * a.shiftmax
-            shifts_np = latent_anima(
-                (n_mult, 2), a.frames, a.fstep, uniform=True,
-                cubic=a.cubic, gauss=a.gauss, seed=noise_seed, verbose=False
-            )  # [frame_count, n_mult, 2]
-            shifts_np = hw_centers + (shifts_np - 0.5) * hw_scales
-        else:
-            shifts_np = np.zeros((frame_count, n_mult, 2))
-
-        if a.anim_rot is True:
-            angles_np = latent_anima(
-                (n_mult, 1), a.frames, a.frames // 4, uniform=True,
-                cubic=a.cubic, gauss=a.gauss, seed=noise_seed, verbose=False
-            )
-            angles_np = (angles_np - 0.5) * 180.
-        else:
-            angles_np = np.zeros((frame_count, n_mult, 1))
-
-        scale_array = np.array([a.affine_scale[0], a.affine_scale[1]], dtype=np.float32)
-        scales_np = np.tile(scale_array, (frame_count, n_mult, 1))
-
-        shifts = torch.from_numpy(shifts_np).to(device)
-        angles = torch.from_numpy(angles_np).to(device)
-        scales = torch.from_numpy(scales_np).to(device)
-        trans_params = list(zip(shifts, angles, scales))
-    else:
-        trans_params = [None] * frame_count
-
-    # distort (digress)
-    if hasattr(Gs.synthesis, 'input'):
-        first_layer_channels = Gs.synthesis.input.channels
-        first_layer_size = Gs.synthesis.input.size
-        if isinstance(first_layer_size, (list, tuple, np.ndarray)):
-            h_, w_ = first_layer_size[0], first_layer_size[1]
-        else:
-            h_, w_ = first_layer_size, first_layer_size
-        shape_for_dconst = [1, first_layer_channels, h_, w_]
-    else:
-        first_layer_channels = 0
-        shape_for_dconst = [1, 0, 0, 0]
-
-    if a.digress != 0 and first_layer_channels > 0:
-        dconst_list = []
-        for i in range(n_mult):
-            dc_tmp = a.digress * latent_anima(
-                shape_for_dconst,
-                a.frames, a.fstep, cubic=True, seed=noise_seed, verbose=False
-            )
-            dconst_list.append(dc_tmp)
-        dconst_np = np.concatenate(dconst_list, axis=1)  # [frame_count, n_mult*channels, h_, w_]
-    else:
-        # 何もしない
-        dconst_np = np.zeros([frame_count, 1, first_layer_channels, 1])  # 省略形
-
-    dconst = torch.from_numpy(dconst_np).to(device).to(torch.float32)
-
-    # ワームアップ
-    with torch.no_grad():
-        if custom:
-            if hasattr(Gs.synthesis, 'input'):
-                _ = Gs(latents[0], labels[0], lmask[0], trans_params[0], dconst[0], noise_mode='const')
-            else:
-                _ = Gs(latents[0], labels[0], lmask[0], noise_mode='const')
-        else:
-            _ = Gs(latents[0], labels[0], truncation_psi=a.trunc, noise_mode='const')
-
-    # 返却
-    return {
-        'Gs': Gs,
-        'latents': latents,
-        'labels': labels,
-        'lmask': lmask,
-        'trans_params': trans_params,
-        'dconst': dconst,
-        'frame_count': frame_count,
-        'n_mult': n_mult,
-        'device': device,
-        'custom': custom,
-    }
-
-def generate_colab_demo(a, noise_seed):
+# =============================================
+# 2) ランダムウォークで無限に返すジェネレータ
+# =============================================
+def infinite_latent_random_walk(z_dim, device, seed=None, step_size=0.02):
     """
-    Colab上で短いループを回して画像をノートブックセルに表示し続けるサンプルモード。
+    毎フレーム、前回の潜在ベクトルに少しだけ乱数を加えて更新する。
+    ピクピク動きやすいが簡単。
     """
-    context = setup_generator(a, noise_seed)
+    rng = np.random.RandomState(seed) if seed is not None else np.random
+    z_prev = rng.randn(z_dim)  # 初期
+    while True:
+        # 乱数を加えて更新 (ランダムウォーク)
+        z_prev = z_prev + rng.randn(z_dim) * step_size
+        yield torch.from_numpy(z_prev).unsqueeze(0).to(device)
 
-    Gs          = context['Gs']
-    latents     = context['latents']
-    labels      = context['labels']
-    lmask       = context['lmask']
-    trans_params= context['trans_params']
-    dconst      = context['dconst']
-    frame_count = context['frame_count']
-    n_mult      = context['n_mult']
-    device      = context['device']
-    custom      = context['custom']
 
-    print("=== Colab デモ開始 ===")
-    print("ノートブックセルの出力が画像で上書きされ続けます。ループ終了後、最後の画像だけが残ります。")
-
-    # ループ回数を小さくして試す（ここでは30フレーム）
-    demo_frames = 30
-    for i in range(demo_frames):
-        idx = i % frame_count
-
-        latent      = latents[idx]
-        label       = labels[idx % len(labels)]
-        latmask     = lmask[idx % len(lmask)]
-        dc          = dconst[idx % len(dconst)]
-        trans_param = trans_params[idx % len(trans_params)]
-
-        with torch.no_grad():
-            if custom:
-                if hasattr(Gs.synthesis, 'input'):  # SG3
-                    output = Gs(latent, label, latmask, trans_param, dc,
-                                truncation_psi=a.trunc, noise_mode='const')
-                else:
-                    output = Gs(latent, label, latmask,
-                                truncation_psi=a.trunc, noise_mode='const')
-            else:
-                output = Gs(latent, label,
-                            truncation_psi=a.trunc, noise_mode='const')
-
-        # 後処理
-        output = (output.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
-        output_np = output[0].cpu().numpy()  # shape = [H, W, 3]
-
-        # ノートブックセルへ表示 (前フレームを消して新しい画像を出力)
-        clear_output(wait=True)
-        display(Image.fromarray(output_np, 'RGB'))
-        time.sleep(0.2)
-
-    print("=== Colab デモ終了 ===")
-    
+# =============================================
+# 3) 実際にリアルタイムプレビューする関数
+# =============================================
 def generate_realtime_local(a, noise_seed):
     """
-    ローカルマシンで cv2.imshow によるリアルタイムプレビューを行うが、
-    毎フレーム新しい latent をランダムウォークで生成して、
-    ループ再生ではなく「無限に続くリアルタイム生成」にする版。
+    こちらが無限リアルタイム生成 + OpenCV表示を行う本体。
+    --method smooth か --method random_walk でモードを切り替える。
     """
-    import math
 
-    # ネットワークを読み込み（従来の setup_generator の一部だけ使う）
-    # ---------------------------------------------------------
     torch.manual_seed(noise_seed)
     np.random.seed(noise_seed)
     random.seed(noise_seed)
@@ -371,7 +202,7 @@ def generate_realtime_local(a, noise_seed):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     os.makedirs(a.out_dir, exist_ok=True)
 
-    # モデル読み込み
+    # ネットワーク読み込み --------------------------------
     Gs_kwargs = dnnlib.EasyDict()
     Gs_kwargs.verbose = a.verbose
     Gs_kwargs.size = None
@@ -389,109 +220,155 @@ def generate_realtime_local(a, noise_seed):
     with dnnlib.util.open_url(pkl_name + '.pkl') as f:
         Gs = legacy.load_network_pkl(f, custom=custom, rot=rot, **Gs_kwargs)['G_ema'].to(device)
 
-    # 解像度が欲しい場合
-    out_resolution = Gs.img_resolution  # SG3ならこう取れる
-    print("Model resolution =", out_resolution)
-
-    # ラベル・条件付け（単純に None にしておく or ユーザ指定があれば一様に設定）
+    z_dim = Gs.z_dim
     c_dim = Gs.c_dim
+
+    # ラベル（条件付け）
     if c_dim > 0 and a.labels is not None:
         label = torch.zeros([1, c_dim], device=device)
-        label_idx = min(int(a.labels), c_dim-1)  # 単純化
+        label_idx = min(int(a.labels), c_dim - 1)
         label[0, label_idx] = 1
     else:
         label = None
 
-    # 乱数ウォームアップ
-    z_dim = Gs.z_dim
-    z_current = torch.randn([1, z_dim], device=device)
-
-    # SG3 の回転・移動の乱数パラメータも適当に初期化
-    # （必要に応じて使う）
-    shift_current = torch.zeros([1, 2], device=device)   # (x, y)
-    angle_current = torch.zeros([1, 1], device=device)   # (angle)
-    scale_current = torch.ones([1, 2], device=device)    # (sy, sx)
-
-    # distort (digress) に相当する最初のconstブロック
-    if hasattr(Gs.synthesis, 'input'):
+    # SG3 の distortion 用 const
+    if custom and hasattr(Gs.synthesis, 'input'):
         first_layer_channels = Gs.synthesis.input.channels
-        h_, w_ = (Gs.synthesis.input.size, Gs.synthesis.input.size) \
-                 if isinstance(Gs.synthesis.input.size, int) else Gs.synthesis.input.size
+        if isinstance(Gs.synthesis.input.size, int):
+            h_, w_ = Gs.synthesis.input.size, Gs.synthesis.input.size
+        else:
+            h_, w_ = Gs.synthesis.input.size[0], Gs.synthesis.input.size[1]
+        dconst_current = torch.zeros([1, first_layer_channels, h_, w_], device=device)
     else:
-        first_layer_channels = 0
-        h_, w_ = 1, 1
+        dconst_current = None
 
-    dconst_current = torch.zeros([1, first_layer_channels, h_, w_], device=device)
-
-    # 初回推論でメモリ確保
+    # 初回ウォームアップ推論
     with torch.no_grad():
         if custom and hasattr(Gs.synthesis, 'input'):
-            _ = Gs(z_current, label, None, (shift_current, angle_current, scale_current), dconst_current, noise_mode='const')
+            _ = Gs(torch.randn([1, z_dim], device=device), label, None,
+                   (torch.zeros([1,2], device=device),
+                    torch.zeros([1,1], device=device),
+                    torch.ones ([1,2], device=device)),
+                   dconst_current, noise_mode='const')
         else:
-            _ = Gs(z_current, label, truncation_psi=a.trunc, noise_mode='const')
+            _ = Gs(torch.randn([1, z_dim], device=device), label,
+                   truncation_psi=a.trunc, noise_mode='const')
 
-    print("=== Start Real-time Preview with infinite random walk ===")
-    print("ウィンドウが表示されます。終了するには 'q' キーを押してください。")
+    # どちらのモードで潜在ベクトルを無限生成するか切り替え
+    if a.method == 'random_walk':
+        print("=== Real-time Preview (random_walk mode) ===")
+        latent_gen = infinite_latent_random_walk(
+            z_dim=z_dim, device=device, seed=noise_seed, step_size=0.02
+        )
+    else:
+        print("=== Real-time Preview (smooth latent_anima mode) ===")
+        latent_gen = infinite_latent_smooth(
+            z_dim=z_dim, device=device,
+            cubic=a.cubic, gauss=a.gauss,
+            seed=noise_seed,
+            chunk_size=60,   # 1区間に60フレームで補間 (お好みで)
+            uniform=False    # False→slerp, True→lerp
+        )
 
+    print("ウィンドウが表示されます。終了する場合は 'q' キーを押してください。")
+
+    # FPS計測用
+    fps_count = 0
+    t0 = time.time()
+
+    # メインループ (無限)
     frame_idx = 0
-    step_size_z = 0.02   # latent のランダムウォークの振れ幅
-    step_size_tr = 0.005 # translation のランダムウォークの振れ幅
-    step_size_ag = 1.0   # rotation のランダムウォークの振れ幅(度単位)
-    step_size_dc = 0.05  # distorion const layer の変化
-
     while True:
-        # ランダムウォークでlatentを更新
-        z_current = z_current + torch.randn_like(z_current) * step_size_z
-        # 位置シフトのランダムウォーク
-        shift_current = shift_current + torch.randn_like(shift_current) * step_size_tr
-        # 回転角のランダムウォーク
-        angle_current = angle_current + torch.randn_like(angle_current) * step_size_ag
-        # scaleはあまり極端に崩れないように
-        scale_current = scale_current + torch.randn_like(scale_current) * 0.001
-        # distort layer
-        if first_layer_channels > 0:
-            dconst_current = dconst_current + torch.randn_like(dconst_current) * step_size_dc
+        # 1フレームぶんの latent をジェネレータから取得
+        z_current = next(latent_gen)
 
-        # SG3に渡すtrans_param
-        trans_param = (shift_current, angle_current, scale_current)
+        # SG3パラメータ (今回は簡易: 平行移動/回転/スケールは使わず固定する)
+        # anim_trans, anim_rot を本格的に使うなら、ここでも同様に補間 or random_walk すればOK
+        if custom and hasattr(Gs.synthesis, 'input'):
+            trans_param = (
+                torch.zeros([1,2], device=device),   # shift
+                torch.zeros([1,1], device=device),   # angle
+                torch.ones([1,2],  device=device)    # scale
+            )
+        else:
+            trans_param = None
 
         with torch.no_grad():
             if custom and hasattr(Gs.synthesis, 'input'):
-                output = Gs(z_current, label, None, trans_param, dconst_current,
+                output = Gs(z_current, label, None,
+                            trans_param, dconst_current,
                             truncation_psi=a.trunc, noise_mode='const')
             else:
-                output = Gs(z_current, label, truncation_psi=a.trunc, noise_mode='const')
+                output = Gs(z_current, label,
+                            truncation_psi=a.trunc, noise_mode='const')
 
-        # 後処理: (N, C, H, W) → (H, W, C) → BGR
-        output = (output.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
+        # 後処理
+        output = (output.permute(0,2,3,1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
         out_np = output[0].cpu().numpy()
         out_cv = out_np[..., ::-1]  # BGR
 
-        # ウィンドウに表示
+        # OpenCVで表示
         out_cv = img_resize_for_cv2(out_cv)
-        cv2.imshow("StyleGAN3 Real-time (Infinite)", out_cv)
+        cv2.imshow("StyleGAN3 Real-time Preview", out_cv)
+
+        # FPS計測
+        fps_count += 1
+        elapsed = time.time() - t0
+        if elapsed >= 1.0:  # 1秒ごとに更新
+            fps = fps_count / elapsed
+            # 同じ行に上書き表示 ("\r" で行頭に戻り、print(..., end='')
+            print(f"\r{fps:.2f} fps", end='')
+            sys.stdout.flush()
+            t0 = time.time()
+            fps_count = 0
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
-            print("終了します。")
+            print("\n終了します。")
             break
 
         frame_idx += 1
 
     cv2.destroyAllWindows()
 
+def generate_colab_demo(a, noise_seed):
+    """
+    Colab上で短いループを回して画像をノートブックセルに表示し続けるサンプルモード。
+    こちらはオフライン(バッチ)想定でフレーム数決め打ち、ループ再生する。
+    """
+    print("=== Colab デモ開始 ===")
+    print("(こちらは従来のフレーム固定デモです)")
+
+    # 必要最低限だけネットワーク読み込み (簡略)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    pkl_name = osp.splitext(a.model)[0]
+    with dnnlib.util.open_url(pkl_name + '.pkl') as f:
+        Gs = legacy.load_network_pkl(f)['G_ema'].to(device)
+
+    frames = 30
+    for i in range(frames):
+        z = torch.randn([1, Gs.z_dim], device=device)
+        with torch.no_grad():
+            output = Gs(z, None, truncation_psi=a.trunc, noise_mode='const')
+        output = (output.permute(0,2,3,1)*127.5+128).clamp(0,255).to(torch.uint8)
+        out_np = output[0].cpu().numpy()
+        clear_output(wait=True)
+        display(Image.fromarray(out_np, 'RGB'))
+        time.sleep(0.2)
+
+    print("=== Colab デモ終了 ===")
 
 def main():
     a = parser.parse_args()
 
-    # Colab デモモードフラグが立っているかどうかで挙動を分ける
     if a.colab_demo:
         print("Colabデモモードで起動します (cv2によるリアルタイムウィンドウは使いません)")
         for i in range(a.variations):
             generate_colab_demo(a, a.noise_seed + i)
     else:
-        # 通常はローカルPCでのリアルタイムプレビューを実行
         print("ローカル環境でのリアルタイムプレビューを行います (cv2使用)")
+        # 無限生成プレビュー (smooth or random_walk)
         for i in range(a.variations):
             generate_realtime_local(a, a.noise_seed + i)
 
