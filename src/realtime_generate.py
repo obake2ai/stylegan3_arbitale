@@ -311,11 +311,11 @@ def generate_realtime_local(a, noise_seed):
 
         with torch.no_grad():
             if custom and hasattr(Gs.synthesis, 'input'):
-                output = Gs(z_current, label, None,
+                output = Gs(z_current, label, latmask,
                             trans_param, dconst_current,
                             truncation_psi=a.trunc, noise_mode='const')
             else:
-                output = Gs(z_current, label,
+                output = Gs(z_current, label, latmask,
                             truncation_psi=a.trunc, noise_mode='const')
 
         # 後処理
