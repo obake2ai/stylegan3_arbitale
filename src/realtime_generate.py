@@ -63,10 +63,6 @@ parser.add_argument('--colab_demo', action='store_true', help='Colab上でサン
 parser.add_argument('--method', default='smooth', choices=['smooth', 'random_walk'],
                     help='smooth: latent_animaを使ったなめらかな無限補間, random_walk: 毎フレーム少し乱数を足す。')
 
-if a.size is not None:
-    a.size = [int(s) for s in a.size.split('-')][::-1]
-    if len(a.size) == 1: a.size = a.size * 2
-
 def img_resize_for_cv2(img):
     """
     OpenCVウィンドウに表示するときに大きすぎる場合があるので、
@@ -381,6 +377,9 @@ def generate_colab_demo(a, noise_seed):
 
 def main():
     a = parser.parse_args()
+    if a.size is not None:
+        a.size = [int(s) for s in a.size.split('-')][::-1]
+        if len(a.size) == 1: a.size = a.size * 2
 
     if a.colab_demo:
         print("Colabデモモードで起動します (cv2によるリアルタイムウィンドウは使いません)")
