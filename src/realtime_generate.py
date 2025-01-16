@@ -194,7 +194,7 @@ def generate_realtime_local(a, noise_seed):
     # ネットワーク読み込み --------------------------------
     Gs_kwargs = dnnlib.EasyDict()
     Gs_kwargs.verbose = a.verbose
-    Gs_kwargs.size = None
+    # Gs_kwargs.size = None
     Gs_kwargs.scale_type = a.scale_type
 
     # mask/blend latents with external latmask or by splitting the frame
