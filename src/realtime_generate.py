@@ -437,6 +437,7 @@ def main():
     if a.size is not None:
         a.size = [int(s) for s in a.size.split('-')][::-1]
         if len(a.size) == 1: a.size = a.size * 2
+    if a.affine_scale is not None: a.affine_scale = [float(s) for s in a.affine_scale.split('-')][::-1]
 
     if a.colab_demo:
         print("Colabデモモードで起動します (cv2によるリアルタイムウィンドウは使いません)")
