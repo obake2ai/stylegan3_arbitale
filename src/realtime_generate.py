@@ -248,16 +248,51 @@ def generate_realtime_local(a, noise_seed):
     else:
         label = None
 
-    # SG3 の distortion 用 const
-    if custom and hasattr(Gs.synthesis, 'input'):
-        first_layer_channels = Gs.synthesis.input.channels
-        if isinstance(Gs.synthesis.input.size, int):
-            h_, w_ = Gs.synthesis.input.size, Gs.synthesis.input.size
+    # NEW SG3
+    if hasattr(Gs.synthesis, 'input'): # SG3
+        if a.anim_trans is True:
+            hw_centers = [np.linspace(-1+1/n, 1-1/n, n) for n in nHW]
+            yy,xx = np.meshgrid(*hw_centers)
+            xscale = [s / Gs.img_resolution for s in a.size]
+            hw_centers = np.dstack((yy.flatten()[:n_mult], xx.flatten()[:n_mult])) * xscale * 0.5 * a.shiftbase
+            hw_scales = np.array([2. / n for n in nHW]) * a.shiftmax
+            shifts = latent_anima((n_mult, 2), a.frames, a.fstep, uniform=True, cubic=a.cubic, gauss=a.gauss, seed=a.noise_seed, verbose=False) # [frm,X,2]
+            shifts = hw_centers + (shifts - 0.5) * hw_scales
         else:
-            h_, w_ = Gs.synthesis.input.size[0], Gs.synthesis.input.size[1]
-        dconst_current = torch.zeros([1, first_layer_channels, h_, w_], device=device)
+            shifts = np.zeros((1, n_mult, 2))
+        if a.anim_rot is True:
+            angles = latent_anima((n_mult, 1), a.frames, a.frames//4, uniform=True, cubic=a.cubic, gauss=a.gauss, seed=a.noise_seed, verbose=False) # [frm,X,1]
+            angles = (angles - 0.5) * 180.
+        else:
+            angles = np.zeros((1, n_mult, 1))
+        # 拡大率 (scale_x, scale_y) を各フレームに反映
+        # ここでは a.affine_scale = [scale_y, scale_x] を想定し、全フレーム同一値にしています
+        # (毎フレームアニメさせたい場合は latent_anima 等で生成してもOK)
+        scale_array = np.array([a.affine_scale[0], a.affine_scale[1]], dtype=np.float32)  # (scale_y, scale_x)
+        # shifts.shape = [frame_count, n_mult, 2]
+        # angles.shape = [frame_count, n_mult, 1]
+        #  → 同じフレーム数・枚数に合わせて scale_array をタイル展開
+        scales = np.tile(scale_array, (shifts.shape[0], shifts.shape[1], 1))  # [frame_count, n_mult, 2]
+
+        shifts = torch.from_numpy(shifts).to(device)
+        angles = torch.from_numpy(angles).to(device)
+        scales = torch.from_numpy(scales).to(device)   # [frame_count, X, 2]
+
+        trans_params = list(zip(shifts, angles, scales))
+
+    if a.digress != 0:
+        dconst_list = []
+        for i in range(n_mult):
+            dc_tmp = a.digress * latent_anima(
+                shape_for_dconst,  # [1, 1024, 36, 36] 等
+                a.frames, a.fstep, cubic=True, seed=noise_seed, verbose=False
+            )
+            dconst_list.append(dc_tmp)
+        dconst = np.concatenate(dconst_list, axis=1)
     else:
-        dconst_current = None
+        dconst = np.zeros([latents.shape[0], 1, first_layer_channels, h, w])
+
+    dconst = torch.from_numpy(dconst).to(device).to(torch.float32)
 
     # 初回ウォームアップ推論
     with torch.no_grad():
@@ -300,6 +335,7 @@ def generate_realtime_local(a, noise_seed):
             # ここで latent を1個取り出して推論
             z_current = next(latent_gen)
             latmask   = lmask[frame_idx_local % len(lmask)]
+            dconst_current = dconst[frame_idx % len(dconst)]
 
             if custom and hasattr(Gs.synthesis, 'input'):
                 trans_param = (
