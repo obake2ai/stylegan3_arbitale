@@ -312,7 +312,7 @@ def generate_realtime_local(a, noise_seed):
                    (torch.zeros([1,2], device=device),
                     torch.zeros([1,1], device=device),
                     torch.ones ([1,2], device=device)),
-                   dconst_current, noise_mode='const')
+                   dconst[0], noise_mode='const')
         else:
             _ = Gs(torch.randn([1, z_dim], device=device), label, lmask[0],
                    truncation_psi=a.trunc, noise_mode='const')
