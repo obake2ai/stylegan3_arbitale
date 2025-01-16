@@ -353,60 +353,127 @@ def generate_colab_demo(a, noise_seed):
         time.sleep(0.2)
 
     print("=== Colab デモ終了 ===")
-
+    
 def generate_realtime_local(a, noise_seed):
     """
-    ローカルマシンで cv2.imshow によるリアルタイムプレビューを行う場合の関数。
+    ローカルマシンで cv2.imshow によるリアルタイムプレビューを行うが、
+    毎フレーム新しい latent をランダムウォークで生成して、
+    ループ再生ではなく「無限に続くリアルタイム生成」にする版。
     """
-    context = setup_generator(a, noise_seed)
+    import math
 
-    Gs          = context['Gs']
-    latents     = context['latents']
-    labels      = context['labels']
-    lmask       = context['lmask']
-    trans_params= context['trans_params']
-    dconst      = context['dconst']
-    frame_count = context['frame_count']
-    n_mult      = context['n_mult']
-    device      = context['device']
-    custom      = context['custom']
+    # ネットワークを読み込み（従来の setup_generator の一部だけ使う）
+    # ---------------------------------------------------------
+    torch.manual_seed(noise_seed)
+    np.random.seed(noise_seed)
+    random.seed(noise_seed)
 
-    print("=== Start Real-time Preview (ローカル環境専用) ===")
-    print("ウィンドウが表示されます。終了する場合はウィンドウをアクティブにして 'q' キーを押してください。")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    os.makedirs(a.out_dir, exist_ok=True)
+
+    # モデル読み込み
+    Gs_kwargs = dnnlib.EasyDict()
+    Gs_kwargs.verbose = a.verbose
+    Gs_kwargs.size = None
+    Gs_kwargs.scale_type = a.scale_type
+
+    pkl_name = osp.splitext(a.model)[0]
+    if '.pkl' in a.model.lower():
+        custom = False
+        print(' .. Gs from pkl ..', basename(a.model))
+    else:
+        custom = True
+        print(' .. Gs custom ..', basename(a.model))
+
+    rot = True if ('-r-' in a.model.lower() or 'sg3r-' in a.model.lower()) else False
+    with dnnlib.util.open_url(pkl_name + '.pkl') as f:
+        Gs = legacy.load_network_pkl(f, custom=custom, rot=rot, **Gs_kwargs)['G_ema'].to(device)
+
+    # 解像度が欲しい場合
+    out_resolution = Gs.img_resolution  # SG3ならこう取れる
+    print("Model resolution =", out_resolution)
+
+    # ラベル・条件付け（単純に None にしておく or ユーザ指定があれば一様に設定）
+    c_dim = Gs.c_dim
+    if c_dim > 0 and a.labels is not None:
+        label = torch.zeros([1, c_dim], device=device)
+        label_idx = min(int(a.labels), c_dim-1)  # 単純化
+        label[0, label_idx] = 1
+    else:
+        label = None
+
+    # 乱数ウォームアップ
+    z_dim = Gs.z_dim
+    z_current = torch.randn([1, z_dim], device=device)
+
+    # SG3 の回転・移動の乱数パラメータも適当に初期化
+    # （必要に応じて使う）
+    shift_current = torch.zeros([1, 2], device=device)   # (x, y)
+    angle_current = torch.zeros([1, 1], device=device)   # (angle)
+    scale_current = torch.ones([1, 2], device=device)    # (sy, sx)
+
+    # distort (digress) に相当する最初のconstブロック
+    if hasattr(Gs.synthesis, 'input'):
+        first_layer_channels = Gs.synthesis.input.channels
+        h_, w_ = (Gs.synthesis.input.size, Gs.synthesis.input.size) \
+                 if isinstance(Gs.synthesis.input.size, int) else Gs.synthesis.input.size
+    else:
+        first_layer_channels = 0
+        h_, w_ = 1, 1
+
+    dconst_current = torch.zeros([1, first_layer_channels, h_, w_], device=device)
+
+    # 初回推論でメモリ確保
+    with torch.no_grad():
+        if custom and hasattr(Gs.synthesis, 'input'):
+            _ = Gs(z_current, label, None, (shift_current, angle_current, scale_current), dconst_current, noise_mode='const')
+        else:
+            _ = Gs(z_current, label, truncation_psi=a.trunc, noise_mode='const')
+
+    print("=== Start Real-time Preview with infinite random walk ===")
+    print("ウィンドウが表示されます。終了するには 'q' キーを押してください。")
 
     frame_idx = 0
-    while True:
-        current_idx = frame_idx % frame_count
+    step_size_z = 0.02   # latent のランダムウォークの振れ幅
+    step_size_tr = 0.005 # translation のランダムウォークの振れ幅
+    step_size_ag = 1.0   # rotation のランダムウォークの振れ幅(度単位)
+    step_size_dc = 0.05  # distorion const layer の変化
 
-        latent      = latents[current_idx]
-        label       = labels[current_idx % len(labels)]
-        latmask     = lmask[current_idx % len(lmask)]
-        dc          = dconst[current_idx % len(dconst)]
-        trans_param = trans_params[current_idx % len(trans_params)]
+    while True:
+        # ランダムウォークでlatentを更新
+        z_current = z_current + torch.randn_like(z_current) * step_size_z
+        # 位置シフトのランダムウォーク
+        shift_current = shift_current + torch.randn_like(shift_current) * step_size_tr
+        # 回転角のランダムウォーク
+        angle_current = angle_current + torch.randn_like(angle_current) * step_size_ag
+        # scaleはあまり極端に崩れないように
+        scale_current = scale_current + torch.randn_like(scale_current) * 0.001
+        # distort layer
+        if first_layer_channels > 0:
+            dconst_current = dconst_current + torch.randn_like(dconst_current) * step_size_dc
+
+        # SG3に渡すtrans_param
+        trans_param = (shift_current, angle_current, scale_current)
 
         with torch.no_grad():
-            if custom:
-                if hasattr(Gs.synthesis, 'input'):  # SG3
-                    output = Gs(latent, label, latmask, trans_param, dc,
-                                truncation_psi=a.trunc, noise_mode='const')
-                else:
-                    output = Gs(latent, label, latmask,
-                                truncation_psi=a.trunc, noise_mode='const')
-            else:
-                output = Gs(latent, label,
+            if custom and hasattr(Gs.synthesis, 'input'):
+                output = Gs(z_current, label, None, trans_param, dconst_current,
                             truncation_psi=a.trunc, noise_mode='const')
+            else:
+                output = Gs(z_current, label, truncation_psi=a.trunc, noise_mode='const')
 
+        # 後処理: (N, C, H, W) → (H, W, C) → BGR
         output = (output.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
-        output_np = output[0].cpu().numpy()  # shape = [H, W, 3]
+        out_np = output[0].cpu().numpy()
+        out_cv = out_np[..., ::-1]  # BGR
 
-        # OpenCVで表示 (BGRに変換)
-        preview_img = output_np[..., ::-1]
-        preview_img = img_resize_for_cv2(preview_img)
-        cv2.imshow("StyleGAN3 Real-time Preview", preview_img)
+        # ウィンドウに表示
+        out_cv = img_resize_for_cv2(out_cv)
+        cv2.imshow("StyleGAN3 Real-time (Infinite)", out_cv)
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
-            print("プレビューを終了します。")
+            print("終了します。")
             break
 
         frame_idx += 1
