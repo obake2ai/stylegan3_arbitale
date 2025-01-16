@@ -118,19 +118,6 @@ def checkout(output, i, out_dir):
     filename = osp.join(out_dir, "%06d.%s" % (i, ext))
     imsave(filename, output[0], quality=95)
 
-# -------------------------------------------------------
-# ▼ もともとの latent_anima 関数 (util.utilgan 側) を再掲
-#   今回は外部から参照するだけなのでコピーは不要ですが、
-#   動作イメージのため、ユーザ要望に沿って貼り付け。
-#
-# def latent_anima(shape, frames, transit, key_latents=None, somehot=None, smooth=0.5,
-#                  uniform=False, cubic=False, gauss=False, seed=None, start_lat=None,
-#                  loop=True, verbose=True):
-#     ...
-#     return latents
-# -------------------------------------------------------
-
-
 # =============================================
 # 1) スムース (latent_anima) を無限に返すジェネレータ
 # =============================================
@@ -210,6 +197,31 @@ def generate_realtime_local(a, noise_seed):
     Gs_kwargs.size = None
     Gs_kwargs.scale_type = a.scale_type
 
+    # mask/blend latents with external latmask or by splitting the frame
+    if a.latmask is None:
+        nHW = [int(s) for s in a.nXY.split('-')][::-1]
+        assert len(nHW)==2, ' Wrong count nXY: %d (must be 2)' % len(nHW)
+        n_mult = nHW[0] * nHW[1]
+        if a.splitmax is not None: n_mult = min(n_mult, a.splitmax)
+        Gs_kwargs.countHW = nHW
+        Gs_kwargs.splitfine = a.splitfine
+        if a.splitmax is not None: Gs_kwargs.splitmax = a.splitmax
+        if a.verbose is True and n_mult > 1: print(' Latent blending w/split frame %d x %d' % (nHW[1], nHW[0]))
+        lmask = [None]
+
+    else:
+        n_mult = 2
+        nHW = [1,1]
+        if osp.isfile(a.latmask): # single file
+            lmask = np.asarray([[img_read(a.latmask)[:,:,0] / 255.]]) # [1,1,h,w]
+        elif osp.isdir(a.latmask): # directory with frame sequence
+            lmask = np.expand_dims(np.asarray([img_read(f)[:,:,0] / 255. for f in img_list(a.latmask)]), 1) # [n,1,h,w]
+        else:
+            print(' !! Blending mask not found:', a.latmask); exit(1)
+        if a.verbose is True: print(' Latent blending with mask', a.latmask, lmask.shape)
+        lmask = np.concatenate((lmask, 1 - lmask), 1) # [n,2,h,w]
+        lmask = torch.from_numpy(lmask).to(device)
+
     pkl_name = osp.splitext(a.model)[0]
     if '.pkl' in a.model.lower():
         custom = False
@@ -247,13 +259,13 @@ def generate_realtime_local(a, noise_seed):
     # 初回ウォームアップ推論
     with torch.no_grad():
         if custom and hasattr(Gs.synthesis, 'input'):
-            _ = Gs(torch.randn([1, z_dim], device=device), label, None,
+            _ = Gs(torch.randn([1, z_dim], device=device), label, lmask[0],
                    (torch.zeros([1,2], device=device),
                     torch.zeros([1,1], device=device),
                     torch.ones ([1,2], device=device)),
                    dconst_current, noise_mode='const')
         else:
-            _ = Gs(torch.randn([1, z_dim], device=device), label,
+            _ = Gs(torch.randn([1, z_dim], device=device), label, lmask[0],
                    truncation_psi=a.trunc, noise_mode='const')
 
     # どちらのモードで潜在ベクトルを無限生成するか切り替え
@@ -283,6 +295,8 @@ def generate_realtime_local(a, noise_seed):
     while True:
         # 1フレームぶんの latent をジェネレータから取得
         z_current = next(latent_gen)
+
+        latmask = lmask[frame_idx % len(lmask)]
 
         # SG3パラメータ (今回は簡易: 平行移動/回転/スケールは使わず固定する)
         # anim_trans, anim_rot を本格的に使うなら、ここでも同様に補間 or random_walk すればOK
