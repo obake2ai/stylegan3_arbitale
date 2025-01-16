@@ -311,15 +311,13 @@ def generate_realtime_local(a, noise_seed):
                 trans_param = None
 
             with torch.no_grad():
-                # Mixed precision (オプション)
-                with torch.autocast("cuda"):
-                    if custom and hasattr(Gs.synthesis, 'input'):
-                        out = Gs(z_current, label, latmask,
-                                 trans_param, dconst_current,
-                                 truncation_psi=a.trunc, noise_mode='const')
-                    else:
-                        out = Gs(z_current, label, latmask,
-                                 truncation_psi=a.trunc, noise_mode='const')
+                if custom and hasattr(Gs.synthesis, 'input'):
+                    out = Gs(z_current, label, latmask,
+                             trans_param, dconst_current,
+                             truncation_psi=a.trunc, noise_mode='const')
+                else:
+                    out = Gs(z_current, label, latmask,
+                             truncation_psi=a.trunc, noise_mode='const')
 
             out = (out.permute(0,2,3,1) * 127.5 + 128).clamp(0,255).to(torch.uint8)
             out_np = out[0].cpu().numpy()[..., ::-1]  # BGR
