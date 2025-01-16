@@ -280,6 +280,17 @@ def generate_realtime_local(a, noise_seed):
 
         trans_params = list(zip(shifts, angles, scales))
 
+    # distort image by tweaking initial const layer
+    first_layer_channels = Gs.synthesis.input.channels
+    first_layer_size     = Gs.synthesis.input.size
+    if isinstance(first_layer_size, (list, tuple, np.ndarray)):
+        h, w = first_layer_size[0], first_layer_size[1]
+    else:
+        h, w = first_layer_size, first_layer_size
+
+    shape_for_dconst = [1, first_layer_channels, h, w]
+    #("debug shape_for_dconst =", shape_for_dconst)
+
     if a.digress != 0:
         dconst_list = []
         for i in range(n_mult):
