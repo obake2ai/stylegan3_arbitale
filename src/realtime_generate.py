@@ -21,6 +21,9 @@ import sys
 from IPython.display import display, clear_output
 from PIL import Image
 
+import queue
+import threading
+
 torch.backends.cudnn.benchmark = True
 
 desc = "Customized StyleGAN3 on PyTorch (リアルタイムプレビュー & Colab デモ版)"
@@ -268,6 +271,12 @@ def generate_realtime_local(a, noise_seed):
             _ = Gs(torch.randn([1, z_dim], device=device), label, lmask[0],
                    truncation_psi=a.trunc, noise_mode='const')
 
+    # 1) 生成したフレームを格納するキュー。maxsizeは適当。
+    frame_queue = queue.Queue(maxsize=30)
+
+    # 2) スレッド停止用のイベント
+    stop_event = threading.Event()
+
     # どちらのモードで潜在ベクトルを無限生成するか切り替え
     if a.method == 'random_walk':
         print("=== Real-time Preview (random_walk mode) ===")
@@ -284,6 +293,45 @@ def generate_realtime_local(a, noise_seed):
             uniform=False    # False→slerp, True→lerp
         )
 
+    # 3) フレーム生成(推論)を行うサブスレッドを定義
+    def producer_thread():
+        frame_idx_local = 0
+        while not stop_event.is_set():
+            # ここで latent を1個取り出して推論
+            z_current = next(latent_gen)
+            latmask   = lmask[frame_idx_local % len(lmask)]
+
+            if custom and hasattr(Gs.synthesis, 'input'):
+                trans_param = (
+                    torch.zeros([1,2], device=device),
+                    torch.zeros([1,1], device=device),
+                    torch.ones ([1,2], device=device)
+                )
+            else:
+                trans_param = None
+
+            with torch.no_grad():
+                # Mixed precision (オプション)
+                with torch.autocast("cuda", dtype=torch.float16):
+                    if custom and hasattr(Gs.synthesis, 'input'):
+                        out = Gs(z_current, label, latmask,
+                                 trans_param, dconst_current,
+                                 truncation_psi=a.trunc, noise_mode='const')
+                    else:
+                        out = Gs(z_current, label, latmask,
+                                 truncation_psi=a.trunc, noise_mode='const')
+
+            out = (out.permute(0,2,3,1) * 127.5 + 128).clamp(0,255).to(torch.uint8)
+            out_np = out[0].cpu().numpy()[..., ::-1]  # BGR
+
+            # キューが満杯ならブロックし、空きが出るまで待機
+            frame_queue.put(out_np)
+            frame_idx_local += 1
+
+    # 4) スレッドを起動
+    thread_prod = threading.Thread(target=producer_thread, daemon=True)
+    thread_prod.start()
+
     print("ウィンドウが表示されます。終了する場合は 'q' キーを押してください。")
 
     # FPS計測用
@@ -293,35 +341,9 @@ def generate_realtime_local(a, noise_seed):
     # メインループ (無限)
     frame_idx = 0
     while True:
-        # 1フレームぶんの latent をジェネレータから取得
-        z_current = next(latent_gen)
-
-        latmask = lmask[frame_idx % len(lmask)]
-
-        # SG3パラメータ (今回は簡易: 平行移動/回転/スケールは使わず固定する)
-        # anim_trans, anim_rot を本格的に使うなら、ここでも同様に補間 or random_walk すればOK
-        if custom and hasattr(Gs.synthesis, 'input'):
-            trans_param = (
-                torch.zeros([1,2], device=device),   # shift
-                torch.zeros([1,1], device=device),   # angle
-                torch.ones([1,2],  device=device)    # scale
-            )
-        else:
-            trans_param = None
-
-        with torch.no_grad():
-            if custom and hasattr(Gs.synthesis, 'input'):
-                output = Gs(z_current, label, latmask,
-                            trans_param, dconst_current,
-                            truncation_psi=a.trunc, noise_mode='const')
-            else:
-                output = Gs(z_current, label, latmask,
-                            truncation_psi=a.trunc, noise_mode='const')
-
-        # 後処理
-        output = (output.permute(0,2,3,1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
-        out_np = output[0].cpu().numpy()
-        out_cv = out_np[..., ::-1]  # BGR
+        # 5) バッファから1枚取り出して描画
+        #    producer側でまだフレームが用意できていないときはブロック (待機)
+        out_cv = frame_queue.get()
 
         # OpenCVで表示
         out_cv = img_resize_for_cv2(out_cv)
@@ -341,6 +363,7 @@ def generate_realtime_local(a, noise_seed):
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             print("\n終了します。")
+            stop_event.set()
             break
 
         frame_idx += 1
