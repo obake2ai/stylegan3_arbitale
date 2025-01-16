@@ -222,4 +222,211 @@ def setup_generator(a, noise_seed=0):
             hw_centers = np.dstack((yy.flatten()[:n_mult], xx.flatten()[:n_mult])) * xscale * 0.5 * a.shiftbase
             hw_scales = np.array([2. / n for n in nHW]) * a.shiftmax
             shifts_np = latent_anima(
-                (n_mult, 2), a.fram
+                (n_mult, 2), a.frames, a.fstep, uniform=True,
+                cubic=a.cubic, gauss=a.gauss, seed=noise_seed, verbose=False
+            )  # [frame_count, n_mult, 2]
+            shifts_np = hw_centers + (shifts_np - 0.5) * hw_scales
+        else:
+            shifts_np = np.zeros((frame_count, n_mult, 2))
+
+        if a.anim_rot is True:
+            angles_np = latent_anima(
+                (n_mult, 1), a.frames, a.frames // 4, uniform=True,
+                cubic=a.cubic, gauss=a.gauss, seed=noise_seed, verbose=False
+            )
+            angles_np = (angles_np - 0.5) * 180.
+        else:
+            angles_np = np.zeros((frame_count, n_mult, 1))
+
+        scale_array = np.array([a.affine_scale[0], a.affine_scale[1]], dtype=np.float32)
+        scales_np = np.tile(scale_array, (frame_count, n_mult, 1))
+
+        shifts = torch.from_numpy(shifts_np).to(device)
+        angles = torch.from_numpy(angles_np).to(device)
+        scales = torch.from_numpy(scales_np).to(device)
+        trans_params = list(zip(shifts, angles, scales))
+    else:
+        trans_params = [None] * frame_count
+
+    # distort (digress)
+    if hasattr(Gs.synthesis, 'input'):
+        first_layer_channels = Gs.synthesis.input.channels
+        first_layer_size = Gs.synthesis.input.size
+        if isinstance(first_layer_size, (list, tuple, np.ndarray)):
+            h_, w_ = first_layer_size[0], first_layer_size[1]
+        else:
+            h_, w_ = first_layer_size, first_layer_size
+        shape_for_dconst = [1, first_layer_channels, h_, w_]
+    else:
+        first_layer_channels = 0
+        shape_for_dconst = [1, 0, 0, 0]
+
+    if a.digress != 0 and first_layer_channels > 0:
+        dconst_list = []
+        for i in range(n_mult):
+            dc_tmp = a.digress * latent_anima(
+                shape_for_dconst,
+                a.frames, a.fstep, cubic=True, seed=noise_seed, verbose=False
+            )
+            dconst_list.append(dc_tmp)
+        dconst_np = np.concatenate(dconst_list, axis=1)  # [frame_count, n_mult*channels, h_, w_]
+    else:
+        # 何もしない
+        dconst_np = np.zeros([frame_count, 1, first_layer_channels, 1])  # 省略形
+
+    dconst = torch.from_numpy(dconst_np).to(device).to(torch.float32)
+
+    # ワームアップ
+    with torch.no_grad():
+        if custom:
+            if hasattr(Gs.synthesis, 'input'):
+                _ = Gs(latents[0], labels[0], lmask[0], trans_params[0], dconst[0], noise_mode='const')
+            else:
+                _ = Gs(latents[0], labels[0], lmask[0], noise_mode='const')
+        else:
+            _ = Gs(latents[0], labels[0], truncation_psi=a.trunc, noise_mode='const')
+
+    # 返却
+    return {
+        'Gs': Gs,
+        'latents': latents,
+        'labels': labels,
+        'lmask': lmask,
+        'trans_params': trans_params,
+        'dconst': dconst,
+        'frame_count': frame_count,
+        'n_mult': n_mult,
+        'device': device,
+        'custom': custom,
+    }
+
+def generate_colab_demo(a, noise_seed):
+    """
+    Colab上で短いループを回して画像をノートブックセルに表示し続けるサンプルモード。
+    """
+    context = setup_generator(a, noise_seed)
+
+    Gs          = context['Gs']
+    latents     = context['latents']
+    labels      = context['labels']
+    lmask       = context['lmask']
+    trans_params= context['trans_params']
+    dconst      = context['dconst']
+    frame_count = context['frame_count']
+    n_mult      = context['n_mult']
+    device      = context['device']
+    custom      = context['custom']
+
+    print("=== Colab デモ開始 ===")
+    print("ノートブックセルの出力が画像で上書きされ続けます。ループ終了後、最後の画像だけが残ります。")
+
+    # ループ回数を小さくして試す（ここでは30フレーム）
+    demo_frames = 30
+    for i in range(demo_frames):
+        idx = i % frame_count
+
+        latent      = latents[idx]
+        label       = labels[idx % len(labels)]
+        latmask     = lmask[idx % len(lmask)]
+        dc          = dconst[idx % len(dconst)]
+        trans_param = trans_params[idx % len(trans_params)]
+
+        with torch.no_grad():
+            if custom:
+                if hasattr(Gs.synthesis, 'input'):  # SG3
+                    output = Gs(latent, label, latmask, trans_param, dc,
+                                truncation_psi=a.trunc, noise_mode='const')
+                else:
+                    output = Gs(latent, label, latmask,
+                                truncation_psi=a.trunc, noise_mode='const')
+            else:
+                output = Gs(latent, label,
+                            truncation_psi=a.trunc, noise_mode='const')
+
+        # 後処理
+        output = (output.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
+        output_np = output[0].cpu().numpy()  # shape = [H, W, 3]
+
+        # ノートブックセルへ表示 (前フレームを消して新しい画像を出力)
+        clear_output(wait=True)
+        display(Image.fromarray(output_np, 'RGB'))
+        time.sleep(0.2)
+
+    print("=== Colab デモ終了 ===")
+
+def generate_realtime_local(a, noise_seed):
+    """
+    ローカルマシンで cv2.imshow によるリアルタイムプレビューを行う場合の関数。
+    """
+    context = setup_generator(a, noise_seed)
+
+    Gs          = context['Gs']
+    latents     = context['latents']
+    labels      = context['labels']
+    lmask       = context['lmask']
+    trans_params= context['trans_params']
+    dconst      = context['dconst']
+    frame_count = context['frame_count']
+    n_mult      = context['n_mult']
+    device      = context['device']
+    custom      = context['custom']
+
+    print("=== Start Real-time Preview (ローカル環境専用) ===")
+    print("ウィンドウが表示されます。終了する場合はウィンドウをアクティブにして 'q' キーを押してください。")
+
+    frame_idx = 0
+    while True:
+        current_idx = frame_idx % frame_count
+
+        latent      = latents[current_idx]
+        label       = labels[current_idx % len(labels)]
+        latmask     = lmask[current_idx % len(lmask)]
+        dc          = dconst[current_idx % len(dconst)]
+        trans_param = trans_params[current_idx % len(trans_params)]
+
+        with torch.no_grad():
+            if custom:
+                if hasattr(Gs.synthesis, 'input'):  # SG3
+                    output = Gs(latent, label, latmask, trans_param, dc,
+                                truncation_psi=a.trunc, noise_mode='const')
+                else:
+                    output = Gs(latent, label, latmask,
+                                truncation_psi=a.trunc, noise_mode='const')
+            else:
+                output = Gs(latent, label,
+                            truncation_psi=a.trunc, noise_mode='const')
+
+        output = (output.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
+        output_np = output[0].cpu().numpy()  # shape = [H, W, 3]
+
+        # OpenCVで表示 (BGRに変換)
+        preview_img = output_np[..., ::-1]
+        preview_img = img_resize_for_cv2(preview_img)
+        cv2.imshow("StyleGAN3 Real-time Preview", preview_img)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            print("プレビューを終了します。")
+            break
+
+        frame_idx += 1
+
+    cv2.destroyAllWindows()
+
+
+def main():
+    a = parser.parse_args()
+
+    # Colab デモモードフラグが立っているかどうかで挙動を分ける
+    if a.colab_demo:
+        print("Colabデモモードで起動します (cv2によるリアルタイムウィンドウは使いません)")
+        for i in range(a.variations):
+            generate_colab_demo(a, a.noise_seed + i)
+    else:
+        # 通常はローカルPCでのリアルタイムプレビューを実行
+        print("ローカル環境でのリアルタイムプレビューを行います (cv2使用)")
+        for i in range(a.variations):
+            generate_realtime_local(a, a.noise_seed + i)
+
+if __name__ == '__main__':
+    main()
