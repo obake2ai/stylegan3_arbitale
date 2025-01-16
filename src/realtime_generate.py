@@ -295,24 +295,7 @@ def generate_realtime_local(a, noise_seed):
         else:
             trans_param = None
 
-        with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
-            # Gs に渡すすべてのテンソルを z_current.dtype (fp16) に合わせる
-            z_current = z_current.to(z_current.device, dtype=torch.float16)
-
-            if label is not None:
-                label = label.to(z_current.device, dtype=torch.float16)
-
-            if dconst_current is not None:
-                dconst_current = dconst_current.to(z_current.device, dtype=torch.float16)
-
-            if trans_param is not None:
-                # trans_param = (shift, angle, scale) のタプル等なら要素ごとにキャスト
-                shift, angle, scale = trans_param
-                shift = shift.to(z_current.device, torch.float16)
-                angle = angle.to(z_current.device, torch.float16)
-                scale = scale.to(z_current.device, torch.float16)
-                trans_param = (shift, angle, scale)
-
+        with torch.no_grad():
             if custom and hasattr(Gs.synthesis, 'input'):
                 output = Gs(z_current, label, None,
                             trans_param, dconst_current,
